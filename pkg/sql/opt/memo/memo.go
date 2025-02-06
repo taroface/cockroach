@@ -200,6 +200,8 @@ type Memo struct {
 	pushLimitIntoProjectFilteredScan           bool
 	unsafeAllowTriggersModifyingCascades       bool
 	legacyVarcharTyping                        bool
+	preferBoundedCardinality                   bool
+	minRowCount                                float64
 	internal                                   bool
 
 	// txnIsoLevel is the isolation level under which the plan was created. This
@@ -233,8 +235,9 @@ type Memo struct {
 // IsStale method for more details).
 func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 	// This initialization pattern ensures that fields are not unwittingly
-	// reused. Field reuse must be explicit.
+	// reused. Field reuse must be explicitpkg/sql/opt/memo/memo.go.
 	*m = Memo{
+		//nolint metadata is being reused.
 		metadata:                                   m.metadata,
 		reorderJoinsLimit:                          int(evalCtx.SessionData().ReorderJoinsLimit),
 		zigzagJoinEnabled:                          evalCtx.SessionData().ZigzagJoinEnabled,
@@ -292,6 +295,8 @@ func (m *Memo) Init(ctx context.Context, evalCtx *eval.Context) {
 		pushLimitIntoProjectFilteredScan:           evalCtx.SessionData().OptimizerPushLimitIntoProjectFilteredScan,
 		unsafeAllowTriggersModifyingCascades:       evalCtx.SessionData().UnsafeAllowTriggersModifyingCascades,
 		legacyVarcharTyping:                        evalCtx.SessionData().LegacyVarcharTyping,
+		preferBoundedCardinality:                   evalCtx.SessionData().OptimizerPreferBoundedCardinality,
+		minRowCount:                                evalCtx.SessionData().OptimizerMinRowCount,
 		internal:                                   evalCtx.SessionData().Internal,
 		txnIsoLevel:                                evalCtx.TxnIsoLevel,
 	}
@@ -462,6 +467,8 @@ func (m *Memo) IsStale(
 		m.pushLimitIntoProjectFilteredScan != evalCtx.SessionData().OptimizerPushLimitIntoProjectFilteredScan ||
 		m.unsafeAllowTriggersModifyingCascades != evalCtx.SessionData().UnsafeAllowTriggersModifyingCascades ||
 		m.legacyVarcharTyping != evalCtx.SessionData().LegacyVarcharTyping ||
+		m.preferBoundedCardinality != evalCtx.SessionData().OptimizerPreferBoundedCardinality ||
+		m.minRowCount != evalCtx.SessionData().OptimizerMinRowCount ||
 		m.internal != evalCtx.SessionData().Internal ||
 		m.txnIsoLevel != evalCtx.TxnIsoLevel {
 		return true, nil
@@ -470,10 +477,8 @@ func (m *Memo) IsStale(
 	// Memo is stale if the fingerprint of any object in the memo's metadata has
 	// changed, or if the current user no longer has sufficient privilege to
 	// access the object.
-	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil {
+	if depsUpToDate, err := m.Metadata().CheckDependencies(ctx, evalCtx, catalog); err != nil || !depsUpToDate {
 		return true, err
-	} else if !depsUpToDate {
-		return true, nil
 	}
 	return false, nil
 }

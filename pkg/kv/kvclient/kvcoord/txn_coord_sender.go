@@ -161,9 +161,10 @@ type TxnCoordSender struct {
 	// additional heap allocations necessary.
 	interceptorStack []txnInterceptor
 	interceptorAlloc struct {
-		arr [6]txnInterceptor
+		arr [7]txnInterceptor
 		txnHeartbeater
 		txnSeqNumAllocator
+		txnWriteBuffer
 		txnPipeliner
 		txnCommitter
 		txnSpanRefresher
@@ -275,6 +276,10 @@ func newRootTxnCoordSender(
 		// Various interceptors below rely on sequence number allocation,
 		// so the sequence number allocator is near the top of the stack.
 		&tcs.interceptorAlloc.txnSeqNumAllocator,
+		// The write buffer sits above the pipeliner to ensure it doesn't need to
+		// know how to handle QueryIntentRequests, as those are only generated (and
+		// handled) by the pipeliner.
+		&tcs.interceptorAlloc.txnWriteBuffer,
 		// The pipeliner sits above the span refresher because it will
 		// never generate transaction retry errors that could be avoided
 		// with a refresh.
@@ -1148,6 +1153,25 @@ func (tc *TxnCoordSender) SetOmitInRangefeeds() {
 		panic("cannot change OmitInRangefeeds of a running transaction")
 	}
 	tc.mu.txn.OmitInRangefeeds = true
+}
+
+// SetBufferedWritesEnabled is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) SetBufferedWritesEnabled(enabled bool) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	if tc.mu.active && enabled && !tc.interceptorAlloc.txnWriteBuffer.enabled {
+		panic("cannot enable buffered writes on a running transaction")
+	}
+	tc.interceptorAlloc.txnWriteBuffer.enabled = enabled
+}
+
+// BufferedWritesEnabled is part of the kv.TxnSender interface.
+func (tc *TxnCoordSender) BufferedWritesEnabled() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	return tc.interceptorAlloc.txnWriteBuffer.enabled
 }
 
 // String is part of the kv.TxnSender interface.

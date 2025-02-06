@@ -283,6 +283,7 @@ func (t *leaseTest) node(nodeID uint32) *lease.Manager {
 		)
 		ctx := logtags.AddTag(context.Background(), "leasemgr", nodeID)
 		mgr.RunBackgroundLeasingTask(ctx)
+		mgr.TestingMarkInit()
 		t.nodes[nodeID] = mgr
 	}
 	return mgr
@@ -1157,33 +1158,36 @@ func TestLeaseAtLatestVersion(t *testing.T) {
 	srv, sqlDB, kvDB := serverutils.StartServer(t, params)
 	defer srv.Stopper().Stop(context.Background())
 	s := srv.ApplicationLayer()
-
+	// We will intentionally put t2 in a different database, so that wait for
+	// initial version does not apply. Otherwise, a newly published version of kv
+	// will be instantly acquired, since the schema will be leased after the insert
+	// into timestamp.
 	if _, err := sqlDB.Exec(`
 BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 CREATE DATABASE t;
+CREATE SCHEMA t.sc1;
 CREATE TABLE t.kv (k CHAR PRIMARY KEY, v CHAR);
-CREATE TABLE t.timestamp (k CHAR PRIMARY KEY, v CHAR);
+CREATE TABLE t.sc1.timestamp (k CHAR PRIMARY KEY, v CHAR);
 INSERT INTO t.kv VALUES ('a', 'b');
 COMMIT;
 `); err != nil {
 		t.Fatal(err)
 	}
-
+	leaseMgr := s.LeaseManager().(*lease.Manager)
 	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, s.Codec(), "t", "kv")
 	var updated bool
 	if err := crdb.ExecuteTx(context.Background(), sqlDB, nil, func(tx *gosql.Tx) error {
 		// Insert an entry so that the transaction is guaranteed to be
 		// assigned a timestamp.
 		if _, err := tx.Exec(`
-INSERT INTO t.timestamp VALUES ('a', 'b');
+INSERT INTO t.sc1.timestamp VALUES ('a', 'b');
 `); err != nil {
 			return errors.WithStack(err)
 		}
-
 		// Increment the table version after the txn has started. Only do this once
 		// even if there's a retry.
 		if !updated {
-			leaseMgr := s.LeaseManager().(*lease.Manager)
 			if _, err := leaseMgr.Publish(
 				context.Background(), tableDesc.GetID(), func(catalog.MutableDescriptor) error {
 					// Do nothing: increments the version.
@@ -1193,7 +1197,6 @@ INSERT INTO t.timestamp VALUES ('a', 'b');
 			}
 			updated = true
 		}
-
 		// This select will see version 1 of the table. It will first
 		// acquire a lease on version 2 and note that the table descriptor is
 		// invalid for the transaction, so it will read the previous version
@@ -1628,6 +1631,9 @@ INSERT INTO t.kv VALUES ('a', 'b');
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := txRetry.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
+		t.Fatal(err)
+	}
 	_, err = txRetry.Exec("SAVEPOINT cockroach_restart;")
 	if err != nil {
 		t.Fatal(err)
@@ -1743,6 +1749,9 @@ INSERT INTO t.kv VALUES ('a', 'b');
 
 	txRetry, err := sqlDB.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txRetry.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2454,6 +2463,10 @@ func TestRangefeedUpdatesHandledProperlyInTheFaceOfRaces(t *testing.T) {
 
 	db1 := tc.ServerConn(0)
 	tdb1 := sqlutils.MakeSQLRunner(db1)
+	// Disable acquisition / waiting for the initial version, since the callbacks
+	// above will get held up on the CREATE. This test needs the SELECT after to
+	// be the first acquisition.
+	tdb1.Exec(t, "SET CLUSTER SETTING sql.catalog.descriptor_wait_for_initial_version.enabled=false")
 	db2 := tc.ServerConn(1)
 
 	// Create a couple of descriptors.
@@ -2570,7 +2583,13 @@ func TestLeaseWithOfflineTables(t *testing.T) {
 			desc.State = next
 			return descsCol.WriteDesc(ctx, false /* kvTrace */, desc, txn.KV())
 		}))
-
+		// Wait for the initial version of the descriptor if it's going from DROPPED
+		// to public. This transition doesn't occur in the real world, so the the
+		// descriptor txn will not wait for the initial version.
+		if expected == descpb.DescriptorState_DROP && next == descpb.DescriptorState_PUBLIC {
+			require.NoError(t,
+				execCfg.LeaseManager.WaitForInitialVersion(ctx, descpb.IDs{testTableID()}, retry.Options{}, nil))
+		}
 		// Wait for the lease manager's refresh worker to have processed the
 		// descriptor update.
 		<-blockDescRefreshed
@@ -2613,10 +2632,11 @@ func TestLeaseWithOfflineTables(t *testing.T) {
 	checkLeaseState(true /* shouldBePresent */)
 
 	// Take the table dropped and back online again.
-	// This should relinquish the lease.
+	// This should relinquish the lease. Note: We acquire
+	// leases for new descriptors automatically now.
 	setTableState(descpb.DescriptorState_PUBLIC, descpb.DescriptorState_DROP)
 	setTableState(descpb.DescriptorState_DROP, descpb.DescriptorState_PUBLIC)
-	checkLeaseState(false /* shouldBePresent */)
+	checkLeaseState(true /* shouldBePresent */)
 
 	// Query the table, thereby acquiring a lease once again.
 	runner.CheckQueryResults(t, "SELECT s FROM t.test", [][]string{})
@@ -4082,4 +4102,80 @@ func TestLongLeaseWaitMetrics(t *testing.T) {
 	require.Equal(t, int64(0), srv.MustGetSQLCounter("sql.leases.long_wait_for_no_version"))
 	require.Equal(t, int64(0), srv.MustGetSQLCounter("sql.leases.long_wait_for_two_version_invariant"))
 	require.Equal(t, int64(0), srv.MustGetSQLCounter("sql.leases.long_wait_for_one_version"))
+}
+
+// TestWaitForInitialVersionConcurrent this test is a basic sanity test that
+// intentionally has leases modified or used while the WaitForInitialVersion
+// is happening. The goal of this test is to find any concurrency related
+// bugs in the leasing subsystem with this logic.
+func TestWaitForInitialVersionConcurrent(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+	const numIter = 100
+	const numThreads = 4
+
+	expectedErrors := map[pgcode.Code]struct{}{
+		pgcode.UndefinedTable: {}, // table isn't created yet
+	}
+	tableCreator := func(ctx context.Context, index int) error {
+		stopTableUser := make(chan struct{})
+		defer close(stopTableUser)
+		tableUser := func(ctx context.Context, tblName string) error {
+			execLoop := true
+			// Execute a tight loop during the table creation
+			// process.
+			iter := 0
+			for execLoop {
+				select {
+				// Detect if we should move to the next
+				// table.
+				case <-stopTableUser:
+					execLoop = false
+				default:
+				}
+				var err error
+				// Execute DDL / DML we expect this to succeed or not notice the
+				// table.
+				if iter%2 == 0 {
+					_, err = sqlDB.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN j%d INT", tblName, iter))
+				} else {
+					_, err = sqlDB.Exec(fmt.Sprintf("SELECT * FROM %s", tblName))
+				}
+				// We expect failures when the table doesn't exist.
+				if err != nil {
+					var pqErr *pq.Error
+					if !errors.As(err, &pqErr) {
+						return err
+					}
+					if _, ok := expectedErrors[pgcode.MakeCode(string(pqErr.Code))]; !ok {
+						return err
+					}
+				}
+				iter += 1
+			}
+			return nil
+		}
+		tablePrefix := fmt.Sprintf("table%d_", index)
+		for i := 0; i < numIter; i++ {
+			tblName := fmt.Sprintf("%s%d", tablePrefix, i)
+			grp := ctxgroup.WithContext(ctx)
+			grp.GoCtx(func(ctx context.Context) error {
+				return tableUser(ctx, tblName)
+			})
+			_, err := sqlDB.Exec(fmt.Sprintf("CREATE TABLE %s(n int)", tblName))
+			if err != nil {
+				return err
+			}
+			stopTableUser <- struct{}{}
+			if err := grp.Wait(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	require.NoError(t, ctxgroup.GroupWorkers(ctx, numThreads, tableCreator))
 }

@@ -79,6 +79,7 @@
 /pkg/ccl/importerccl/        @cockroachdb/sql-queries-prs
 
 /pkg/sql/appstatspb           @cockroachdb/obs-prs
+/pkg/sql/contention/          @cockroachdb/obs-prs
 /pkg/sql/execstats/           @cockroachdb/obs-prs
 /pkg/sql/scheduledlogging/    @cockroachdb/obs-prs
 /pkg/sql/sqlstats/            @cockroachdb/obs-prs
@@ -221,6 +222,7 @@
 /pkg/server/server_controller_*.go       @cockroachdb/server-prs
 /pkg/server/server_controller_http.go    @cockroachdb/obs-prs @cockroachdb/server-prs
 /pkg/server/server_controller_sql.go     @cockroachdb/sql-foundations @cockroachdb/server-prs
+/pkg/server/server_drpc_test.go          @cockroachdb/server-prs
 /pkg/server/server_http*.go              @cockroachdb/obs-prs @cockroachdb/server-prs
 /pkg/server/server_import_ts*.go         @cockroachdb/obs-prs @cockroachdb/kv-prs
 /pkg/server/server_obs*                  @cockroachdb/obs-prs

@@ -5,7 +5,6 @@
 
 // {{/*
 //go:build execgen_template
-// +build execgen_template
 
 //
 // This file is the execgen template for cast.eg.go. It's formatted in a
@@ -57,6 +56,7 @@ var (
 	_ = pgcode.Syntax
 	_ = pgdate.ParseTimestamp
 	_ = pgerror.Wrapf
+	_ = log.ExpensiveLogEnabled
 )
 
 // {{/*

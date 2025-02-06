@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
@@ -394,6 +395,8 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 	if sip.agg != nil {
 		sip.aggTimer.Reset(15 * time.Second)
 	}
+
+	defer sip.FlowCtx.Cfg.JobRegistry.MarkAsIngesting(catpb.JobID(sip.spec.JobID))()
 
 	ctx = sip.StartInternal(ctx, streamIngestionProcessorName, sip.agg)
 
@@ -1023,7 +1026,7 @@ func (r *rangeKeyBatcher) flush(ctx context.Context, toFlush mvccRangeKeyValues)
 
 		log.Infof(ctx, "sending SSTable [%s, %s) of size %d (as write: %v)", start, end, len(data), ingestAsWrites)
 		_, _, err := r.db.AddSSTable(ctx, start, end, data,
-			false /* disallowConflicts */, false, /* disallowShadowing */
+			false, /* disallowConflicts */
 			hlc.Timestamp{}, nil /* stats */, ingestAsWrites,
 			r.db.Clock().Now())
 		if err != nil {

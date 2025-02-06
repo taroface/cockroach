@@ -461,6 +461,10 @@ func updateSpanConfigRecords(
 			}
 			return err // not a retryable error, bubble up
 		}
+
+		if log.V(3) {
+			log.Infof(ctx, "successfully updated span config records: deleted = %+#v; upserted = %+#v", toDelete, toUpsert)
+		}
 		return nil // we performed the update; we're done here
 	}
 	return nil
@@ -518,6 +522,16 @@ func (r *incrementalReconciler) reconcile(
 			) error {
 				var err error
 
+				// Using a fixed timestamp prevents this background job from contending
+				// with foreground schema change traffic. Schema changes modify system
+				// objects like system.descriptor, system.descriptor_id_seq, and
+				// system.span_count. The spanconfig reconciler needs to read these
+				// objects also. A fixed timestamp is a defensive measure to help
+				// avoid contention caused by this background job.
+				err = txn.KV().SetFixedTimestamp(ctx, checkpoint)
+				if err != nil {
+					return err
+				}
 				// TODO(irfansharif): Instead of these filter methods for missing
 				// tables and system targets that live on the Reconciler, we could
 				// move this to the SQLTranslator instead, now that the SQLTranslator

@@ -559,6 +559,37 @@ func makeKVFeedMonitoringCfg(
 	}, nil
 }
 
+// getInitialHighWaterAndSpans returns the initial highwater and spans the
+// aggregator is responsible for watching based on ca.spec. InitialHighWater is
+// the minimal resolved timestamps of all InitialResolved timestamps.
+func (ca *changeAggregator) getInitialHighWaterAndSpans() (hlc.Timestamp, []roachpb.Span) {
+	if ca.spec.InitialHighWater != nil {
+		spans := make([]roachpb.Span, 0, len(ca.spec.Watches))
+		for _, watch := range ca.spec.Watches {
+			spans = append(spans, watch.Span)
+		}
+		return *ca.spec.InitialHighWater, spans
+	} else {
+		// Keep initialHighWater as the minimum of all InitialResolved timestamps.
+		// If there are any zero InitialResolved timestamps, initial scan is
+		// ongoing. If there are no zero InitialResolved timestamps, initial scan
+		// is not required.
+		var initialHighWater hlc.Timestamp
+		spans := make([]roachpb.Span, 0, len(ca.spec.Watches))
+		for i, watch := range ca.spec.Watches {
+			spans = append(spans, watch.Span)
+			if i == 0 {
+				initialHighWater = watch.InitialResolved
+				continue
+			}
+			if watch.InitialResolved.Less(initialHighWater) {
+				initialHighWater = watch.InitialResolved
+			}
+		}
+		return initialHighWater, spans
+	}
+}
+
 // setupSpans is called on start to extract the spans for this changefeed as a
 // slice and creates a span frontier with the initial resolved timestamps. This
 // SpanFrontier only tracks the spans being watched on this node. There is a
@@ -566,24 +597,7 @@ func makeKVFeedMonitoringCfg(
 // used to filter out some previously emitted rows, and by the cloudStorageSink
 // to name its output files in lexicographically monotonic fashion.
 func (ca *changeAggregator) setupSpansAndFrontier() (spans []roachpb.Span, err error) {
-	var initialHighWater hlc.Timestamp
-	spans = make([]roachpb.Span, 0, len(ca.spec.Watches))
-
-	// Keep initialHighWater as the minimum of all InitialResolved timestamps.
-	// If there are any zero InitialResolved timestamps, initial scan is
-	// ongoing. If there are no zero InitialResolved timestamps, initial scan
-	// is not required.
-	for i, watch := range ca.spec.Watches {
-		spans = append(spans, watch.Span)
-		if i == 0 {
-			initialHighWater = watch.InitialResolved
-			continue
-		}
-		if watch.InitialResolved.Less(initialHighWater) {
-			initialHighWater = watch.InitialResolved
-		}
-	}
-
+	initialHighWater, spans := ca.getInitialHighWaterAndSpans()
 	ca.frontier, err = resolvedspan.NewAggregatorFrontier(ca.spec.Feed.StatementTime, initialHighWater, spans...)
 	if err != nil {
 		return nil, err
@@ -1077,7 +1091,10 @@ func (cs *cachedState) SetHighwater(frontier hlc.Timestamp) {
 }
 
 // SetCheckpoint implements the eval.ChangefeedState interface.
-func (cs *cachedState) SetCheckpoint(checkpoint jobspb.ChangefeedProgress_Checkpoint) {
+func (cs *cachedState) SetCheckpoint(
+	//lint:ignore SA1019 deprecated usage
+	checkpoint jobspb.ChangefeedProgress_Checkpoint,
+) {
 	cs.progress.Details.(*jobspb.Progress_Changefeed).Changefeed.Checkpoint = &checkpoint
 }
 
@@ -1094,11 +1111,11 @@ func newJobState(
 }
 
 func canCheckpointSpans(sv *settings.Values, lastCheckpoint time.Time) bool {
-	freq := changefeedbase.FrontierCheckpointFrequency.Get(sv)
-	if freq == 0 {
+	interval := changefeedbase.SpanCheckpointInterval.Get(sv)
+	if interval == 0 {
 		return false
 	}
-	return timeutil.Since(lastCheckpoint) > freq
+	return timeutil.Since(lastCheckpoint) > interval
 }
 
 func (j *jobState) canCheckpointSpans() bool {
@@ -1311,9 +1328,9 @@ func (cf *changeFrontier) Start(ctx context.Context) {
 			return
 		}
 		cf.js.job = job
-		if changefeedbase.FrontierCheckpointFrequency.Get(&cf.FlowCtx.Cfg.Settings.SV) == 0 {
+		if changefeedbase.SpanCheckpointInterval.Get(&cf.FlowCtx.Cfg.Settings.SV) == 0 {
 			log.Warning(ctx,
-				"Frontier checkpointing disabled; set changefeed.frontier_checkpoint_frequency to non-zero value to re-enable")
+				"span-level checkpointing disabled; set changefeed.span_checkpoint.interval to positive duration to re-enable")
 		}
 
 		// Recover highwater information from job progress.
@@ -1673,10 +1690,11 @@ func (cf *changeFrontier) maybeCheckpointJob(
 	updateCheckpoint := (inBackfill || cf.frontier.HasLaggingSpans(&cf.js.settings.SV)) && cf.js.canCheckpointSpans()
 
 	// If the highwater has moved an empty checkpoint will be saved
+	//lint:ignore SA1019 deprecated usage
 	var checkpoint jobspb.ChangefeedProgress_Checkpoint
 	if updateCheckpoint {
-		maxBytes := changefeedbase.FrontierCheckpointMaxBytes.Get(&cf.FlowCtx.Cfg.Settings.SV)
-		checkpoint = cf.frontier.MakeCheckpoint(maxBytes)
+		maxBytes := changefeedbase.SpanCheckpointMaxBytes.Get(&cf.FlowCtx.Cfg.Settings.SV)
+		checkpoint = cf.frontier.MakeCheckpoint(maxBytes, cf.sliMetrics.CheckpointMetrics)
 	}
 
 	if updateCheckpoint || updateHighWater {
@@ -1698,7 +1716,9 @@ func (cf *changeFrontier) maybeCheckpointJob(
 const changefeedJobProgressTxnName = "changefeed job progress"
 
 func (cf *changeFrontier) checkpointJobProgress(
-	frontier hlc.Timestamp, checkpoint jobspb.ChangefeedProgress_Checkpoint,
+	frontier hlc.Timestamp,
+	//lint:ignore SA1019 deprecated usage
+	checkpoint jobspb.ChangefeedProgress_Checkpoint,
 ) (bool, error) {
 	defer cf.sliMetrics.Timers.CheckpointJobProgress.Start()()
 

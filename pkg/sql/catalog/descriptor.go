@@ -243,7 +243,7 @@ type Descriptor interface {
 
 	// GetReferencedDescIDs returns the IDs of all descriptors directly referenced
 	// by this descriptor, including itself.
-	GetReferencedDescIDs() (DescriptorIDSet, error)
+	GetReferencedDescIDs(level ValidationLevel) (DescriptorIDSet, error)
 
 	// ValidateSelf checks the internal consistency of the descriptor.
 	ValidateSelf(vea ValidationErrorAccumulator)
@@ -652,6 +652,10 @@ type TableDescriptor interface {
 	// functions referenced in this table.
 	GetAllReferencedFunctionIDs() (DescriptorIDSet, error)
 
+	// GetAllReferencedFunctionIDsInPolicy returns descriptor IDs of all user
+	// defined functions referenced in this policy.
+	GetAllReferencedFunctionIDsInPolicy(policyID descpb.PolicyID) DescriptorIDSet
+
 	// GetAllReferencedFunctionIDsInConstraint returns descriptor IDs of all user
 	// defined functions referenced in this check constraint.
 	GetAllReferencedFunctionIDsInConstraint(
@@ -835,6 +839,13 @@ type TableDescriptor interface {
 	// GetNextPolicyID returns the next unused policy ID for this table.
 	// Policy IDs are unique per table.
 	GetNextPolicyID() descpb.PolicyID
+	// IsRowLevelSecurityEnabled returns true if we have enabled row level
+	// security for the table and false if it is disabled.
+	IsRowLevelSecurityEnabled() bool
+	// IsRowLevelSecurityForced returns true if we have forced row level
+	// security for the table and false if it is no force. When forced is
+	// set the table's RLS policies are enforced even on the table owner.
+	IsRowLevelSecurityForced() bool
 }
 
 // MutableTableDescriptor is both a MutableDescriptor and a TableDescriptor.

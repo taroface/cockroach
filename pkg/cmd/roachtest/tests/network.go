@@ -8,6 +8,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,14 +20,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	errors "github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors"
 	_ "github.com/lib/pq" // register postgres driver
 	"github.com/stretchr/testify/require"
 )
@@ -50,8 +51,13 @@ func runNetworkAuthentication(ctx context.Context, t test.Test, c cluster.Cluste
 	// that they use coherent certs.
 	settings := install.MakeClusterSettings()
 
-	// Don't create a backup schedule as this test shuts the cluster down immediately.
-	c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), settings, serverNodes)
+	// Don't create a backup schedule in this test as the cluster won't be up
+	// long and we'll inject network issues.
+	// We wait for replication so that we can safely restart the cluster in two
+	// steps next.
+	c.Start(
+		ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule, option.WaitForReplication()), settings, serverNodes,
+	)
 	require.NoError(t, c.StopE(ctx, t.L(), option.DefaultStopOpts(), serverNodes))
 
 	t.L().Printf("restarting nodes...")
@@ -66,16 +72,18 @@ func runNetworkAuthentication(ctx context.Context, t test.Test, c cluster.Cluste
 	// Currently, creating a scheduled backup at start fails, potentially due to
 	// the induced network partition. Further investigation required to allow scheduled backups
 	// to run on this test.
-	startOpts := option.NewStartOpts(option.NoBackupSchedule)
-	startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, "--locality=node=1", "--accept-sql-without-tls")
-	c.Start(ctx, t.L(), startOpts, settings, c.Node(1))
-
-	// See comment above about env vars.
-	// "--env=COCKROACH_SCAN_INTERVAL=200ms",
-	// "--env=COCKROACH_SCAN_MAX_IDLE_TIME=20ms",
-	startOpts = option.NewStartOpts(option.NoBackupSchedule)
-	startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, "--locality=node=other", "--accept-sql-without-tls")
-	c.Start(ctx, t.L(), startOpts, settings, c.Range(2, n-1))
+	{
+		// We start n2+ first so that there's quorum.
+		startOpts := option.NewStartOpts(option.NoBackupSchedule)
+		startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, "--locality=node=other", "--accept-sql-without-tls")
+		c.Start(ctx, t.L(), startOpts, settings, c.Range(2, n-1))
+	}
+	{
+		// Now start n1.
+		startOpts := option.NewStartOpts(option.NoBackupSchedule)
+		startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, "--locality=node=1", "--accept-sql-without-tls")
+		c.Start(ctx, t.L(), startOpts, settings, c.Node(1))
+	}
 
 	t.L().Printf("retrieving server addresses...")
 	serverUrls, err := c.InternalPGUrl(ctx, t.L(), serverNodes, roachprod.PGURLOptions{Auth: install.AuthUserPassword})
@@ -87,7 +95,7 @@ func runNetworkAuthentication(ctx context.Context, t test.Test, c cluster.Cluste
 	require.NoError(t, err)
 	require.NoError(t, os.RemoveAll(localCertsDir))
 	require.NoError(t, c.Get(ctx, t.L(), certsDir, localCertsDir, c.Node(1)))
-	require.NoError(t, filepath.Walk(localCertsDir, func(path string, info os.FileInfo, err error) error {
+	require.NoError(t, filepath.WalkDir(localCertsDir, func(path string, d fs.DirEntry, err error) error {
 		// Don't change permissions for the certs directory.
 		if path == localCertsDir {
 			return nil
@@ -323,12 +331,12 @@ func runClientNetworkConnectionTimeout(ctx context.Context, t test.Test, c clust
 	require.NoError(t, err)
 	defer db.Close()
 
-	grp := ctxgroup.WithContext(ctx)
+	grp := t.NewErrorGroup(task.WithContext(ctx))
 	// Startup a connection on the client server, which will be running a
 	// long transaction (i.e. just the sleep builtin).
 	var runOutput install.RunResultDetails
-	grp.GoCtx(func(ctx context.Context) error {
-		urls, err := roachprod.PgURL(ctx, t.L(), c.MakeNodes(c.Node(1)), certsDir, roachprod.PGURLOptions{
+	grp.Go(func(ctx context.Context, l *logger.Logger) error {
+		urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(c.Node(1)), certsDir, roachprod.PGURLOptions{
 			External: true,
 			Secure:   true,
 		})
@@ -336,8 +344,8 @@ func runClientNetworkConnectionTimeout(ctx context.Context, t test.Test, c clust
 			return err
 		}
 		commandThatWillDisconnect := fmt.Sprintf(`./cockroach sql --certs-dir %s --url %s -e "SELECT pg_sleep(600)"`, certsDir, urls[0])
-		t.L().Printf("Executing long running query: %s", commandThatWillDisconnect)
-		output, err := c.RunWithDetails(ctx, t.L(), option.WithNodes(clientNode), commandThatWillDisconnect)
+		l.Printf("Executing long running query: %s", commandThatWillDisconnect)
+		output, err := c.RunWithDetails(ctx, l, option.WithNodes(clientNode), commandThatWillDisconnect)
 		runOutput = output[0]
 		return err
 	})
@@ -403,7 +411,7 @@ sudo iptables -F OUTPUT;
 	require.Greaterf(t, timeutil.Since(blockStartTime), time.Second*30, "connection dropped earlier than expected")
 	t.L().Printf("Connection was dropped after %s", timeutil.Since(blockStartTime))
 	// We expect the connection to be dropped with the lower keep alive settings.
-	require.NoError(t, grp.Wait())
+	require.NoError(t, grp.WaitE())
 	require.Contains(t, runOutput.Stderr, "If the server is running, check --host client-side and --advertise server-side",
 		"Did not detect connection failure %s %d", runOutput.Stderr, runOutput.RemoteExitStatus)
 }

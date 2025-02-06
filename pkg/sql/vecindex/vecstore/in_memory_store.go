@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/quantize"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/container/list"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -141,7 +142,7 @@ func NewInMemoryStore(dims int, seed int64) *InMemoryStore {
 	// Create empty root partition.
 	var empty vector.Set
 	quantizer := quantize.NewUnQuantizer(dims)
-	quantizedSet := quantizer.Quantize(context.Background(), &empty)
+	quantizedSet := quantizer.Quantize(context.Background(), empty)
 	inMemPartition := &inMemoryPartition{
 		key: RootKey,
 	}
@@ -160,7 +161,12 @@ func NewInMemoryStore(dims int, seed int64) *InMemoryStore {
 	return st
 }
 
-// BeginTransaction implements the Store interface.
+// Dims returns the number of dimensions in stored vectors.
+func (s *InMemoryStore) Dims() int {
+	return s.dims
+}
+
+// Begin implements the Store interface.
 func (s *InMemoryStore) Begin(ctx context.Context) (Txn, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -173,7 +179,7 @@ func (s *InMemoryStore) Begin(ctx context.Context) (Txn, error) {
 	return &elem.Value.activeTxn, nil
 }
 
-// CommitTransaction implements the Store interface.
+// Commit implements the Store interface.
 func (s *InMemoryStore) Commit(ctx context.Context, txn Txn) error {
 	// Release any exclusive partition locks held by the transaction.
 	tx := txn.(*inMemoryTxn)
@@ -233,7 +239,7 @@ func (s *InMemoryStore) Commit(ctx context.Context, txn Txn) error {
 	return nil
 }
 
-// AbortTransaction implements the Store interface.
+// Abort implements the Store interface.
 func (s *InMemoryStore) Abort(ctx context.Context, txn Txn) error {
 	tx := txn.(*inMemoryTxn)
 	if tx.updated {
@@ -337,8 +343,7 @@ func (s *InMemoryStore) MarshalBinary() (data []byte, err error) {
 	}
 
 	storeProto := StoreProto{
-		Dims:       s.dims,
-		Seed:       s.seed,
+		Config:     vecpb.Config{Dims: int32(s.dims), Seed: s.seed},
 		Partitions: make([]PartitionProto, 0, len(s.mu.partitions)),
 		NextKey:    s.mu.nextKey,
 		Vectors:    make([]VectorProto, 0, len(s.mu.vectors)),
@@ -390,8 +395,8 @@ func LoadInMemoryStore(data []byte) (*InMemoryStore, error) {
 
 	// Construct the InMemoryStore object.
 	inMemStore := &InMemoryStore{
-		dims: storeProto.Dims,
-		seed: storeProto.Seed,
+		dims: int(storeProto.Config.Dims),
+		seed: storeProto.Config.Seed,
 	}
 	inMemStore.mu.clock = 2
 	inMemStore.mu.partitions = make(map[PartitionKey]*inMemoryPartition, len(storeProto.Partitions))
@@ -400,8 +405,8 @@ func LoadInMemoryStore(data []byte) (*InMemoryStore, error) {
 	inMemStore.mu.stats = storeProto.Stats
 	inMemStore.mu.pending.Init()
 
-	raBitQuantizer := quantize.NewRaBitQuantizer(storeProto.Dims, storeProto.Seed)
-	unquantizer := quantize.NewUnQuantizer(storeProto.Dims)
+	raBitQuantizer := quantize.NewRaBitQuantizer(int(storeProto.Config.Dims), storeProto.Config.Seed)
+	unquantizer := quantize.NewUnQuantizer(int(storeProto.Config.Dims))
 
 	// Construct the Partition objects.
 	for i := range storeProto.Partitions {

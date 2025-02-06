@@ -23,7 +23,7 @@ import (
 // processes fixups until its context is canceled.
 type fixupWorker struct {
 	// fp points back to the processor that spawned this worker.
-	fp *fixupProcessor
+	fp *FixupProcessor
 	// index points back to the vector index to which fixups are applied.
 	index *VectorIndex
 	// rng is a random number generator. If nil, then the global random number
@@ -39,7 +39,7 @@ type fixupWorker struct {
 }
 
 // NewFixupWorker returns a new worker for the given processor.
-func NewFixupWorker(fp *fixupProcessor) *fixupWorker {
+func NewFixupWorker(fp *FixupProcessor) *fixupWorker {
 	worker := &fixupWorker{
 		fp:    fp,
 		index: fp.index,
@@ -271,7 +271,7 @@ func (fw *fixupWorker) splitPartition(
 		centroids.EnsureCapacity(2)
 		centroids.Add(leftSplit.Partition.Centroid())
 		centroids.Add(rightSplit.Partition.Centroid())
-		quantizedSet := fw.index.rootQuantizer.Quantize(ctx, &centroids)
+		quantizedSet := fw.index.rootQuantizer.Quantize(ctx, centroids)
 		childKeys := []vecstore.ChildKey{
 			{PartitionKey: leftPartitionKey},
 			{PartitionKey: rightPartitionKey},
@@ -579,7 +579,7 @@ func (fw *fixupWorker) mergePartition(
 		if parentPartitionKey != vecstore.RootKey {
 			return errors.AssertionFailedf("only root partition can have zero vectors")
 		}
-		quantizedSet := fw.index.rootQuantizer.Quantize(ctx, &vectors)
+		quantizedSet := fw.index.rootQuantizer.Quantize(ctx, vectors)
 		rootPartition := vecstore.NewPartition(
 			fw.index.rootQuantizer, quantizedSet, partition.ChildKeys(), partition.Level())
 		if err = txn.SetRootPartition(ctx, rootPartition); err != nil {

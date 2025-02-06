@@ -15,7 +15,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -126,7 +128,7 @@ func (w index) GetPredicate() string {
 }
 
 // GetType returns the type of index, inverted or forward.
-func (w index) GetType() descpb.IndexDescriptor_Type {
+func (w index) GetType() idxtype.T {
 	return w.desc.Type
 }
 
@@ -211,7 +213,7 @@ func (w index) InvertedColumnKeyType() *types.T {
 //
 // Panics if the index is not inverted.
 func (w index) InvertedColumnKind() catpb.InvertedIndexColumnKind {
-	if w.desc.Type != descpb.IndexDescriptor_INVERTED {
+	if w.desc.Type != idxtype.INVERTED {
 		panic(errors.AssertionFailedf("index is not inverted"))
 	}
 	if len(w.desc.InvertedColumnKinds) == 0 {
@@ -220,6 +222,20 @@ func (w index) InvertedColumnKind() catpb.InvertedIndexColumnKind {
 		return catpb.InvertedIndexColumnKind_DEFAULT
 	}
 	return w.desc.InvertedColumnKinds[0]
+}
+
+// VectorColumnID returns the ColumnID of the vector column of the vector index.
+// This is always the last column in KeyColumnIDs. Panics if the index is not a
+// vector index.
+func (w index) VectorColumnID() descpb.ColumnID {
+	return w.desc.VectorColumnID()
+}
+
+// VectorColumnName returns the name of the vector column of the vector index.
+// This is always the last column in KeyColumnIDs. Panics if the index is not a
+// vector index.
+func (w index) VectorColumnName() string {
+	return w.desc.VectorColumnName()
 }
 
 // CollectKeyColumnIDs creates a new set containing the column IDs in the key
@@ -262,6 +278,11 @@ func (w index) CollectCompositeColumnIDs() catalog.TableColSet {
 // GetGeoConfig returns the geo config in the index descriptor.
 func (w index) GetGeoConfig() geopb.Config {
 	return w.desc.GeoConfig
+}
+
+// GetVecConfig returns the vec config in the index descriptor.
+func (w index) GetVecConfig() vecpb.Config {
+	return w.desc.VecConfig
 }
 
 // GetSharded returns the ShardedDescriptor in the index descriptor
@@ -508,6 +529,11 @@ func (w index) GetConstraintValidity() descpb.ConstraintValidity {
 // IsEnforced implements the catalog.Constraint interface.
 func (w index) IsEnforced() bool {
 	return !w.IsMutation() || w.WriteAndDeleteOnly()
+}
+
+// NewTestIndex wraps an index descriptor in an index struct for use in unit tests.
+func NewTestIndex(desc *descpb.IndexDescriptor, ordinal int) index {
+	return index{desc: desc, ordinal: ordinal}
 }
 
 // partitioning is the backing struct for a catalog.Partitioning interface.

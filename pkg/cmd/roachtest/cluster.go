@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	gosql "database/sql"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,6 +59,9 @@ import (
 func init() {
 	_ = roachprod.InitProviders()
 }
+
+//go:embed tsdump-run.sh
+var tsdumpRunSh string
 
 var (
 	// maps cpuArch to the corresponding crdb binary's absolute path
@@ -1359,10 +1363,7 @@ func (c *clusterImpl) FetchTimeseriesData(ctx context.Context, l *logger.Logger)
 		if err := os.WriteFile(tsDumpGob+".yaml", buf.Bytes(), 0644); err != nil {
 			return err
 		}
-		return os.WriteFile(tsDumpGob+"-run.sh", []byte(`#!/usr/bin/env bash
-
-COCKROACH_DEBUG_TS_IMPORT_FILE=tsdump.gob cockroach start-single-node --insecure $*
-`), 0755)
+		return os.WriteFile(tsDumpGob+"-run.sh", []byte(tsdumpRunSh), 0755)
 	})
 }
 
@@ -1387,7 +1388,7 @@ func (c *clusterImpl) FetchDebugZip(
 	nodes := selectedNodesOrDefault(opts, c.All())
 
 	// Don't hang forever if we can't fetch the debug zip.
-	return timeutil.RunWithTimeout(ctx, "debug zip", 5*time.Minute, func(ctx context.Context) error {
+	return timeutil.RunWithTimeout(ctx, "debug zip", 10*time.Minute, func(ctx context.Context) error {
 		const zipName = "debug.zip"
 		path := filepath.Join(c.t.ArtifactsDir(), dest)
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -1414,7 +1415,7 @@ func (c *clusterImpl) FetchDebugZip(
 			//
 			// Ignore the files in the log directory; we pull the logs separately anyway
 			// so this would only cause duplication.
-			excludeFiles := "*.log,*.txt,*.pprof"
+			excludeFiles := "*.log,*.pprof"
 
 			cmd := roachtestutil.NewCommand("%s debug zip", test.DefaultCockroachPath).
 				Option("include-range-info").
@@ -1529,9 +1530,12 @@ func (c *clusterImpl) HealthStatus(
 		return nil, errors.WithDetail(err, "Unable to get admin UI address(es)")
 	}
 	client := roachtestutil.DefaultHTTPClient(c, l)
+	protocol := "http"
+	if c.IsSecure() {
+		protocol = "https"
+	}
 	getStatus := func(ctx context.Context, nodeIndex, node int) *HealthStatusResult {
-		url := fmt.Sprintf(`https://%s/health?ready=1`, adminAddrs[nodeIndex])
-
+		url := fmt.Sprintf(`%s://%s/health?ready=1`, protocol, adminAddrs[nodeIndex])
 		resp, err := client.Get(ctx, url)
 		if err != nil {
 			return newHealthStatusResult(node, 0, nil, err)
@@ -2311,11 +2315,11 @@ func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error 
 		return errors.Wrap(err, "cluster.StartE")
 	}
 	// Need to prevent world readable files or lib/pq will complain.
-	return filepath.Walk(c.localCertsDir, func(path string, info fs.FileInfo, err error) error {
+	return filepath.WalkDir(c.localCertsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return errors.Wrap(err, "walking localCertsDir failed")
 		}
-		if info.IsDir() {
+		if d.IsDir() {
 			return nil
 		}
 		return os.Chmod(path, 0600)

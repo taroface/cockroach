@@ -4,7 +4,6 @@
 // included in the /LICENSE file.
 
 //go:build lint
-// +build lint
 
 package lint
 
@@ -2861,10 +2860,13 @@ func TestLint(t *testing.T) {
 		t.Parallel()
 
 		roachprodLoggerPkg := "github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+		roachtestTaskPkg := "github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 		// forbiddenImportPkg -> permittedReplacementPkg
 		forbiddenImports := map[string]string{
 			"github.com/cockroachdb/cockroach/pkg/util/log": roachprodLoggerPkg,
 			"log": roachprodLoggerPkg,
+			"github.com/cockroachdb/cockroach/pkg/util/ctxgroup": roachtestTaskPkg,
+			"golang.org/x/sync/errgroup":                         roachtestTaskPkg,
 		}
 
 		// grepBuf creates a grep string that matches any forbidden import pkgs.

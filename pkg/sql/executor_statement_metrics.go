@@ -189,7 +189,6 @@ func (ex *connExecutor) recordStatementSummary(
 		Nodes:                sqlInstanceIDs,
 		KVNodeIDs:            kvNodeIDs,
 		StatementType:        stmt.AST.StatementType(),
-		Plan:                 planner.instrumentation.PlanForStats(ctx),
 		PlanGist:             planner.instrumentation.planGist.String(),
 		StatementError:       stmtErr,
 		IndexRecommendations: idxRecommendations,
@@ -238,7 +237,6 @@ func (ex *connExecutor) recordStatementSummary(
 			ex.planner.DistSQLPlanner().distSQLSrv.Metrics.CumulativeContentionNanos.Inc(queryLevelStats.ContentionTime.Nanoseconds())
 		}
 
-		err = ex.statsCollector.RecordStatementExecStats(recordedStmtStatsKey, *queryLevelStats)
 		if err != nil {
 			if log.V(2 /* level */) {
 				log.Warningf(ctx, "unable to record statement exec stats: %s", err)
@@ -307,12 +305,6 @@ func (ex *connExecutor) recordStatementLatencyMetrics(
 
 		m.StatementFingerprintCount.Add([]byte(stmt.StmtNoConstants))
 
-		labels := map[string]string{}
-		if detailedLatencyMetrics.Get(&ex.server.cfg.Settings.SV) {
-			labels = map[string]string{
-				detailedLatencyMetricLabel: stmt.StmtNoConstants,
-			}
-		}
 		if flags.IsDistributed() {
 			if _, ok := stmt.AST.(*tree.Select); ok {
 				m.DistSQLSelectCount.Inc(1)
@@ -326,7 +318,12 @@ func (ex *connExecutor) recordStatementLatencyMetrics(
 			}
 		}
 		if shouldIncludeInLatencyMetrics {
-			m.SQLExecLatencyDetail.Observe(labels, float64(runLatRaw.Nanoseconds()))
+			if detailedLatencyMetrics.Get(&ex.server.cfg.Settings.SV) {
+				labels := map[string]string{
+					detailedLatencyMetricLabel: stmt.StmtNoConstants,
+				}
+				m.SQLExecLatencyDetail.Observe(labels, float64(runLatRaw.Nanoseconds()))
+			}
 			m.SQLExecLatency.RecordValue(runLatRaw.Nanoseconds())
 			m.SQLServiceLatency.RecordValue(svcLatRaw.Nanoseconds())
 		}

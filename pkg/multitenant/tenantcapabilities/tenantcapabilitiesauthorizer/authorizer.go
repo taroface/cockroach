@@ -121,11 +121,12 @@ func (a *Authorizer) HasCapabilityForBatch(
 	}
 
 	entry, mode := a.getMode(ctx, tenID)
+	if entry.ServiceMode == mtinfopb.ServiceModeNone || entry.ServiceMode == mtinfopb.ServiceModeStopping {
+		return errors.Newf("operation not allowed when in service mode %q", entry.ServiceMode)
+	}
+
 	switch mode {
 	case authorizerModeOn:
-		if entry.ServiceMode == mtinfopb.ServiceModeNone || entry.ServiceMode == mtinfopb.ServiceModeStopping {
-			return errors.Newf("operation not allowed when in service mode %q", entry.ServiceMode)
-		}
 		return a.capCheckForBatch(ctx, tenID, ba, entry)
 	case authorizerModeAllowAll:
 		return nil
@@ -191,14 +192,6 @@ func (a *Authorizer) capCheckForBatch(
 func newTenantDoesNotHaveCapabilityError(cap tenantcapabilities.ID, req kvpb.Request) error {
 	return errors.Newf("client tenant does not have capability %q (%T)", cap, req)
 }
-
-var (
-	errCannotQueryMetadata   = errors.New("client tenant does not have capability to query cluster node metadata")
-	errCannotQueryTSDB       = errors.New("client tenant does not have capability to query timeseries data")
-	errCannotQueryAllMetrics = errors.New("client tenant does not have capability to query non-tenant metrics")
-	errCannotUseNodelocal    = errors.New("client tenant does not have capability to use nodelocal storage")
-	errCannotDebugProcess    = errors.New("client tenant does not have capability to debug the process")
-)
 
 // methodCapability associates a KV method with a capability. The capability can
 // either be static for all instances of the method, or it can be determined
@@ -316,10 +309,29 @@ func (a *Authorizer) BindReader(reader tenantcapabilities.Reader) {
 	a.capabilitiesReader = reader
 }
 
-func (a *Authorizer) HasNodeStatusCapability(ctx context.Context, tenID roachpb.TenantID) error {
+var (
+	errCannotQueryMetadata   = errors.New("client tenant does not have capability to query cluster node metadata")
+	errCannotQueryTSDB       = errors.New("client tenant does not have capability to query timeseries data")
+	errCannotQueryAllMetrics = errors.New("client tenant does not have capability to query non-tenant metrics")
+	errCannotUseNodelocal    = errors.New("client tenant does not have capability to use nodelocal storage")
+	errCannotDebugProcess    = errors.New("client tenant does not have capability to debug the process")
+)
+
+var insufficientCapErrMap = map[tenantcapabilities.ID]error{
+	tenantcapabilities.CanViewNodeInfo:        errCannotQueryMetadata,
+	tenantcapabilities.CanViewTSDBMetrics:     errCannotQueryTSDB,
+	tenantcapabilities.CanUseNodelocalStorage: errCannotUseNodelocal,
+	tenantcapabilities.CanDebugProcess:        errCannotDebugProcess,
+	tenantcapabilities.CanViewAllMetrics:      errCannotQueryAllMetrics,
+}
+
+func (a *Authorizer) hasCapability(
+	ctx context.Context, tenID roachpb.TenantID, cap tenantcapabilities.ID,
+) error {
 	if tenID.IsSystem() {
 		return nil
 	}
+
 	entry, mode := a.getMode(ctx, tenID)
 	switch mode {
 	case authorizerModeOn:
@@ -327,74 +339,41 @@ func (a *Authorizer) HasNodeStatusCapability(ctx context.Context, tenID roachpb.
 	case authorizerModeAllowAll:
 		return nil
 	case authorizerModeV222:
-		return errCannotQueryMetadata
+		return insufficientCapErrMap[cap]
 	default:
 		err := errors.AssertionFailedf("unknown authorizer mode: %d", mode)
 		logcrash.ReportOrPanic(ctx, &a.settings.SV, "%v", err)
 		return err
 	}
 
-	if !tenantcapabilities.MustGetBoolByID(
-		entry.TenantCapabilities, tenantcapabilities.CanViewNodeInfo,
-	) {
-		return errCannotQueryMetadata
+	if !tenantcapabilities.MustGetBoolByID(entry.TenantCapabilities, cap) {
+		return insufficientCapErrMap[cap]
 	}
 	return nil
 }
 
+func (a *Authorizer) HasNodeStatusCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	return a.hasCapability(ctx, tenID, tenantcapabilities.CanViewNodeInfo)
+}
+
 func (a *Authorizer) HasTSDBQueryCapability(ctx context.Context, tenID roachpb.TenantID) error {
-	if tenID.IsSystem() {
-		return nil
-	}
-
-	entry, mode := a.getMode(ctx, tenID)
-	switch mode {
-	case authorizerModeOn:
-		break
-	case authorizerModeAllowAll:
-		return nil
-	case authorizerModeV222:
-		return errCannotQueryTSDB
-	default:
-		err := errors.AssertionFailedf("unknown authorizer mode: %d", mode)
-		logcrash.ReportOrPanic(ctx, &a.settings.SV, "%v", err)
-		return err
-	}
-
-	if !tenantcapabilities.MustGetBoolByID(
-		entry.TenantCapabilities, tenantcapabilities.CanViewTSDBMetrics,
-	) {
-		return errCannotQueryTSDB
-	}
-	return nil
+	return a.hasCapability(ctx, tenID, tenantcapabilities.CanViewTSDBMetrics)
 }
 
 func (a *Authorizer) HasNodelocalStorageCapability(
 	ctx context.Context, tenID roachpb.TenantID,
 ) error {
-	if tenID.IsSystem() {
-		return nil
-	}
-	entry, mode := a.getMode(ctx, tenID)
-	switch mode {
-	case authorizerModeOn:
-		break
-	case authorizerModeAllowAll:
-		return nil
-	case authorizerModeV222:
-		return errCannotUseNodelocal
-	default:
-		err := errors.AssertionFailedf("unknown authorizer mode: %d", mode)
-		logcrash.ReportOrPanic(ctx, &a.settings.SV, "%v", err)
-		return err
-	}
+	return a.hasCapability(ctx, tenID, tenantcapabilities.CanUseNodelocalStorage)
+}
 
-	if !tenantcapabilities.MustGetBoolByID(
-		entry.TenantCapabilities, tenantcapabilities.CanUseNodelocalStorage,
-	) {
-		return errCannotUseNodelocal
-	}
-	return nil
+func (a *Authorizer) HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error {
+	return a.hasCapability(ctx, tenID, tenantcapabilities.CanDebugProcess)
+}
+
+func (a *Authorizer) HasTSDBAllMetricsCapability(
+	ctx context.Context, tenID roachpb.TenantID,
+) error {
+	return a.hasCapability(ctx, tenID, tenantcapabilities.CanViewAllMetrics)
 }
 
 // IsExemptFromRateLimiting returns true if the tenant is not subject to rate limiting.
@@ -419,61 +398,6 @@ func (a *Authorizer) IsExemptFromRateLimiting(ctx context.Context, tenID roachpb
 	return tenantcapabilities.MustGetBoolByID(entry.TenantCapabilities, tenantcapabilities.ExemptFromRateLimiting)
 }
 
-func (a *Authorizer) HasProcessDebugCapability(ctx context.Context, tenID roachpb.TenantID) error {
-	if tenID.IsSystem() {
-		return nil
-	}
-	entry, mode := a.getMode(ctx, tenID)
-	switch mode {
-	case authorizerModeOn:
-		break
-	case authorizerModeAllowAll:
-		return nil
-	case authorizerModeV222:
-		return errCannotDebugProcess
-	default:
-		err := errors.AssertionFailedf("unknown authorizer mode: %d", mode)
-		logcrash.ReportOrPanic(ctx, &a.settings.SV, "%v", err)
-		return err
-	}
-
-	if !tenantcapabilities.MustGetBoolByID(
-		entry.TenantCapabilities, tenantcapabilities.CanDebugProcess,
-	) {
-		return errCannotDebugProcess
-	}
-	return nil
-}
-
-func (a *Authorizer) HasTSDBAllMetricsCapability(
-	ctx context.Context, tenID roachpb.TenantID,
-) error {
-	if tenID.IsSystem() {
-		return nil
-	}
-
-	entry, mode := a.getMode(ctx, tenID)
-	switch mode {
-	case authorizerModeOn:
-		break
-	case authorizerModeAllowAll:
-		return nil
-	case authorizerModeV222:
-		return errCannotQueryTSDB
-	default:
-		err := errors.AssertionFailedf("unknown authorizer mode: %d", mode)
-		logcrash.ReportOrPanic(ctx, &a.settings.SV, "%v", err)
-		return err
-	}
-
-	if !tenantcapabilities.MustGetBoolByID(
-		entry.TenantCapabilities, tenantcapabilities.CanViewAllMetrics,
-	) {
-		return errCannotQueryAllMetrics
-	}
-	return nil
-}
-
 // getMode retrieves the authorization mode.
 func (a *Authorizer) getMode(
 	ctx context.Context, tid roachpb.TenantID,
@@ -481,38 +405,34 @@ func (a *Authorizer) getMode(
 	// We prioritize what the cluster setting tells us.
 	selectedMode = authorizerMode.Get(&a.settings.SV)
 
-	// If the mode is "on", we need to check the capabilities. Are they
-	// available?
-	if selectedMode == authorizerModeOn {
-		a.Lock()
-		reader := a.capabilitiesReader
-		a.Unlock()
-		if reader == nil {
-			// The server has started but the reader hasn't started/bound
-			// yet. Block requests that would need specific capabilities.
-			if a.logEvery.ShouldLog() {
-				log.Warningf(ctx, "capability check for tenant %s before capability reader exists, assuming capability is unavailable", tid)
-			}
+	a.Lock()
+	reader := a.capabilitiesReader
+	a.Unlock()
+	if reader == nil {
+		// The server has started but the reader hasn't started/bound
+		// yet. Block requests that would need specific capabilities.
+		if a.logEvery.ShouldLog() {
+			log.Warningf(ctx, "capability check for tenant %s before capability reader exists, assuming capability is unavailable", tid)
+		}
+		selectedMode = authorizerModeV222
+	} else {
+		// We have a reader. Did we get data from the rangefeed yet?
+		var found bool
+		entry, _, found = reader.GetInfo(tid)
+		if !found {
+			// No data from the rangefeed yet. Assume caps are still
+			// unavailable.
+			log.VInfof(ctx, 2,
+				"no capability information for tenant %s; requests that require capabilities may be denied",
+				tid)
 			selectedMode = authorizerModeV222
-		} else {
-			// We have a reader. Did we get data from the rangefeed yet?
-			var found bool
-			entry, _, found = reader.GetInfo(tid)
-			if !found {
-				// No data from the rangefeed yet. Assume caps are still
-				// unavailable.
-				log.VInfof(ctx, 2,
-					"no capability information for tenant %s; requests that require capabilities may be denied",
-					tid)
-				selectedMode = authorizerModeV222
-			}
-			// Shared service tenants in UA implicitly have all capabilities. If/when
-			// we offer shared service for truly _multi-tenant_ deployments and wish to
-			// restrict some of those tenants, we can add another service mode that is
-			// similar to shared but adds restriction to only granted capabilities.
-			if entry.ServiceMode == mtinfopb.ServiceModeShared {
-				selectedMode = authorizerModeAllowAll
-			}
+		}
+		// Shared service tenants in UA implicitly have all capabilities. If/when
+		// we offer shared service for truly _multi-tenant_ deployments and wish to
+		// restrict some of those tenants, we can add another service mode that is
+		// similar to shared but adds restriction to only granted capabilities.
+		if entry.ServiceMode == mtinfopb.ServiceModeShared {
+			selectedMode = authorizerModeAllowAll
 		}
 	}
 	return entry, selectedMode

@@ -2119,6 +2119,31 @@ func (s *statusServer) NodeUI(
 	return &resp, nil
 }
 
+// NetworkConnectivity collects info about connection statuses across all nodes.
+// This isn't tenant-specific information; it's about networking activity across
+// all tenants between nodes. It's accessible via the system tenant, and here
+// made available to secondary tenants with the `can_debug_process` capability.
+// This works well for shared-process mode, but in external-process mode, this
+// endpoint won't give a complete picture of network connectivity since the SQL
+// server might run entirely outside the KV node. We might need to extend this
+// endpoint or create a new one for SQL-SQL servers and SQL server to KV nodes.
+// This work is for the future. Currently, this endpoint only shows KV-KV nodes
+// network connectivity. So, it's not ready for external-process mode and should
+// only be enabled for shared-process mode. There's nothing enforcing this, but
+// it shouldn't be a problem. See issue #138156
+func (t *statusServer) NetworkConnectivity(
+	ctx context.Context, req *serverpb.NetworkConnectivityRequest,
+) (*serverpb.NetworkConnectivityResponse, error) {
+	ctx = t.AnnotateCtx(ctx)
+
+	err := t.privilegeChecker.RequireViewClusterMetadataPermission(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return t.sqlServer.tenantConnect.NetworkConnectivity(ctx, req)
+}
+
 // NetworkConnectivity collects information about connections statuses across all nodes.
 func (s *systemStatusServer) NetworkConnectivity(
 	ctx context.Context, req *serverpb.NetworkConnectivityRequest,
@@ -3505,7 +3530,7 @@ func (s *statusServer) CancelQuery(
 // endpoint is rate-limited by a semaphore.
 func (s *statusServer) CancelQueryByKey(
 	ctx context.Context, req *serverpb.CancelQueryByKeyRequest,
-) (resp *serverpb.CancelQueryByKeyResponse, retErr error) {
+) (*serverpb.CancelQueryByKeyResponse, error) {
 	local := req.SQLInstanceID == s.sqlServer.SQLInstanceID()
 
 	// Acquiring the semaphore here helps protect both the source and destination
@@ -3523,39 +3548,40 @@ func (s *statusServer) CancelQueryByKey(
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "exceeded rate limit of pgwire cancellation requests")
 	}
-	defer func() {
-		// If we acquired the semaphore but the cancellation request failed, then
-		// hold on to the semaphore for longer. This helps mitigate a DoS attack
-		// of random cancellation requests.
-		if err != nil || (resp != nil && !resp.Canceled) {
-			time.Sleep(1 * time.Second)
-		}
-		alloc.Release()
-	}()
+	defer alloc.Release()
 
-	if local {
-		cancelQueryKey := req.CancelQueryKey
-		session, ok := s.sessionRegistry.GetSessionByCancelKey(cancelQueryKey)
-		if !ok {
+	resp, retErr := func() (*serverpb.CancelQueryByKeyResponse, error) {
+		if local {
+			cancelQueryKey := req.CancelQueryKey
+			session, ok := s.sessionRegistry.GetSessionByCancelKey(cancelQueryKey)
+			if !ok {
+				return &serverpb.CancelQueryByKeyResponse{
+					Error: fmt.Sprintf("session for cancel key %d not found", cancelQueryKey),
+				}, nil
+			}
+
+			isCanceled := session.CancelActiveQueries()
 			return &serverpb.CancelQueryByKeyResponse{
-				Error: fmt.Sprintf("session for cancel key %d not found", cancelQueryKey),
+				Canceled: isCanceled,
 			}, nil
 		}
 
-		isCanceled := session.CancelActiveQueries()
-		return &serverpb.CancelQueryByKeyResponse{
-			Canceled: isCanceled,
-		}, nil
+		// This request needs to be forwarded to another node.
+		ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
+		ctx = s.AnnotateCtx(ctx)
+		client, err := s.dialNode(ctx, roachpb.NodeID(req.SQLInstanceID))
+		if err != nil {
+			return nil, err
+		}
+		return client.CancelQueryByKey(ctx, req)
+	}()
+	// If the cancellation request failed, then hold on to the semaphore for
+	// longer. This helps mitigate a DoS attack of random cancellation requests.
+	if retErr != nil || (resp != nil && !resp.Canceled) {
+		time.Sleep(1 * time.Second)
 	}
 
-	// This request needs to be forwarded to another node.
-	ctx = authserver.ForwardSQLIdentityThroughRPCCalls(ctx)
-	ctx = s.AnnotateCtx(ctx)
-	client, err := s.dialNode(ctx, roachpb.NodeID(req.SQLInstanceID))
-	if err != nil {
-		return nil, err
-	}
-	return client.CancelQueryByKey(ctx, req)
+	return resp, retErr
 }
 
 // ListContentionEvents returns a list of contention events on all nodes in the

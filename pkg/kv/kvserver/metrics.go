@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric/aggmetric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -1815,13 +1815,6 @@ The messages are dropped to help these replicas to recover from I/O overload.`,
 		Unit:        metric.Unit_PERCENT,
 	}
 
-	// Replica queue metrics.
-	metaStoreFailures = metric.Metadata{
-		Name:        "storage.queue.store-failures",
-		Help:        "Number of replicas which failed processing in replica queues due to retryable store errors",
-		Measurement: "Replicas",
-		Unit:        metric.Unit_COUNT,
-	}
 	metaMVCCGCQueueSuccesses = metric.Metadata{
 		Name:        "queue.gc.process.success",
 		Help:        "Number of replicas successfully processed by the MVCC GC queue",
@@ -2330,7 +2323,7 @@ throttled they do count towards 'delay.total' and 'delay.enginebackpressure'.
 	// TODO(mberhault): metrics for key age, per-key file/bytes counts.
 	metaEncryptionAlgorithm = metric.Metadata{
 		Name:        "rocksdb.encryption.algorithm",
-		Help:        "Algorithm in use for encryption-at-rest, see ccl/storageccl/engineccl/enginepbccl/key_registry.proto",
+		Help:        "Algorithm in use for encryption-at-rest, see storage/enginepb/key_registry.proto",
 		Measurement: "Encryption At Rest",
 		Unit:        metric.Unit_CONST,
 	}
@@ -2875,7 +2868,6 @@ type StoreMetrics struct {
 	RaftCoalescedHeartbeatsPending *metric.Gauge
 
 	// Replica queue metrics.
-	StoreFailures                             *metric.Counter
 	MVCCGCQueueSuccesses                      *metric.Counter
 	MVCCGCQueueFailures                       *metric.Counter
 	MVCCGCQueuePending                        *metric.Gauge
@@ -3645,7 +3637,6 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftCoalescedHeartbeatsPending: metric.NewGauge(metaRaftCoalescedHeartbeatsPending),
 
 		// Replica queue metrics.
-		StoreFailures:                             metric.NewCounter(metaStoreFailures),
 		MVCCGCQueueSuccesses:                      metric.NewCounter(metaMVCCGCQueueSuccesses),
 		MVCCGCQueueFailures:                       metric.NewCounter(metaMVCCGCQueueFailures),
 		MVCCGCQueuePending:                        metric.NewGauge(metaMVCCGCQueuePending),
@@ -4161,7 +4152,7 @@ type pebbleCategoryIterMetrics struct {
 	IterBlockReadLatencySum *metric.Counter
 }
 
-func makePebbleCategorizedIterMetrics(category sstable.Category) pebbleCategoryIterMetrics {
+func makePebbleCategorizedIterMetrics(category block.Category) pebbleCategoryIterMetrics {
 	metaBlockBytes := metric.Metadata{
 		Name:        fmt.Sprintf("storage.iterator.category-%s.block-load.bytes", category),
 		Help:        "Bytes loaded by storage sstable iterators (possibly cached).",
@@ -4190,7 +4181,7 @@ func makePebbleCategorizedIterMetrics(category sstable.Category) pebbleCategoryI
 // MetricStruct implements the metric.Struct interface.
 func (m *pebbleCategoryIterMetrics) MetricStruct() {}
 
-func (m *pebbleCategoryIterMetrics) update(stats sstable.CategoryStats) {
+func (m *pebbleCategoryIterMetrics) update(stats block.CategoryStats) {
 	m.IterBlockBytes.Update(int64(stats.BlockBytes))
 	m.IterBlockBytesInCache.Update(int64(stats.BlockBytesInCache))
 	m.IterBlockReadLatencySum.Update(int64(stats.BlockReadDuration))
@@ -4198,20 +4189,20 @@ func (m *pebbleCategoryIterMetrics) update(stats sstable.CategoryStats) {
 
 type pebbleCategoryIterMetricsContainer struct {
 	registry *metric.Registry
-	// metrics slice for all categories; can be directly indexed by sstable.Category.
+	// metrics slice for all categories; can be directly indexed by block.Category.
 	metrics []pebbleCategoryIterMetrics
 }
 
 func (m *pebbleCategoryIterMetricsContainer) init(registry *metric.Registry) {
 	m.registry = registry
-	categories := sstable.Categories()
+	categories := block.Categories()
 	m.metrics = make([]pebbleCategoryIterMetrics, len(categories))
 	for _, c := range categories {
 		m.metrics[c] = makePebbleCategorizedIterMetrics(c)
 	}
 }
 
-func (m *pebbleCategoryIterMetricsContainer) update(stats []sstable.CategoryStatsAggregate) {
+func (m *pebbleCategoryIterMetricsContainer) update(stats []block.CategoryStatsAggregate) {
 	for _, s := range stats {
 		m.metrics[s.Category].update(s.CategoryStats)
 	}

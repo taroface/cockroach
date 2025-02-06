@@ -17,7 +17,7 @@ changefeed.default_range_distribution_strategy	enumeration	default	configures ho
 changefeed.event_consumer_worker_queue_size	integer	16	if changefeed.event_consumer_workers is enabled, this setting sets the maxmimum number of events which a worker can buffer	application
 changefeed.event_consumer_workers	integer	0	the number of workers to use when processing events: <0 disables, 0 assigns a reasonable default, >0 assigns the setting value. for experimental/core changefeeds and changefeeds using parquet format, this is disabled	application
 changefeed.fast_gzip.enabled	boolean	true	use fast gzip implementation	application
-changefeed.frontier_highwater_lag_checkpoint_threshold	duration	10m0s	controls the maximum the high-water mark is allowed to lag behind the leading spans of the frontier before per-span checkpointing is enabled; if 0, checkpointing due to high-water lag is disabled	application
+changefeed.span_checkpoint.lag_threshold (alias: changefeed.frontier_highwater_lag_checkpoint_threshold)	duration	10m0s	the amount of time a changefeed's lagging (slowest) spans must lag behind its leading (fastest) spans before a span-level checkpoint to save leading span progress is written; if 0, span-level checkpoints due to lagging spans is disabled	application
 changefeed.memory.per_changefeed_limit	byte size	512 MiB	controls amount of data that can be buffered per changefeed	application
 changefeed.resolved_timestamp.min_update_interval (alias: changefeed.min_highwater_advance)	duration	0s	minimum amount of time that must have elapsed since the last time a changefeed's resolved timestamp was updated before it is eligible to be updated again; default of 0 means no minimum interval is enforced but updating will still be limited by the average time it takes to checkpoint progress	application
 changefeed.node_throttle_config	string		specifies node level throttling configuration for all changefeeeds	application
@@ -96,6 +96,7 @@ kv.transaction.max_intents_bytes	integer	4194304	maximum number of bytes used to
 kv.transaction.max_refresh_spans_bytes	integer	4194304	maximum number of bytes used to track refresh spans in serializable transactions	application
 kv.transaction.randomized_anchor_key.enabled	boolean	false	dictates whether a transactions anchor key is randomized or not	application
 kv.transaction.reject_over_max_intents_budget.enabled	boolean	false	if set, transactions that exceed their lock tracking budget (kv.transaction.max_intents_bytes) are rejected instead of having their lock spans imprecisely compressed	application
+kv.transaction.write_buffering.enabled	boolean	false	if enabled, transactional writes are buffered on the client	application
 kv.transaction.write_pipelining.locking_reads.enabled	boolean	true	if enabled, transactional locking reads are pipelined through Raft consensus	application
 kv.transaction.write_pipelining.ranged_writes.enabled	boolean	true	if enabled, transactional ranged writes are pipelined through Raft consensus	application
 kv.transaction.write_pipelining.enabled (alias: kv.transaction.write_pipelining_enabled)	boolean	true	if enabled, transactional writes are pipelined through Raft consensus	application
@@ -328,8 +329,6 @@ sql.metrics.statement_details.enabled	boolean	true	collect per-statement query s
 sql.metrics.statement_details.gateway_node.enabled	boolean	false	save the gateway node for each statement fingerprint. If false, the value will be stored as 0.	application
 sql.metrics.statement_details.index_recommendation_collection.enabled	boolean	true	generate an index recommendation for each fingerprint ID	application
 sql.metrics.statement_details.max_mem_reported_idx_recommendations	integer	5000	the maximum number of reported index recommendation info stored in memory	application
-sql.metrics.statement_details.plan_collection.enabled	boolean	false	periodically save a logical plan for each fingerprint	application
-sql.metrics.statement_details.plan_collection.period	duration	5m0s	the time until a new logical plan is collected	application
 sql.metrics.statement_details.threshold	duration	0s	minimum execution time to cause statement statistics to be collected. If configured, no transaction stats are collected.	application
 sql.metrics.transaction_details.enabled	boolean	true	collect per-application transaction statistics	application
 sql.multiple_modifications_of_table.enabled	boolean	false	if true, allow statements containing multiple INSERT ON CONFLICT, UPSERT, UPDATE, or DELETE subqueries modifying the same table, at the risk of data corruption if the same row is modified multiple times by a single statement (multiple INSERT subqueries without ON CONFLICT cannot cause corruption and are always allowed)	application
@@ -346,6 +345,7 @@ sql.stats.automatic_partial_collection.enabled	boolean	true	automatic partial st
 sql.stats.automatic_partial_collection.fraction_stale_rows	float	0.05	target fraction of stale rows per table that will trigger a partial statistics refresh	application
 sql.stats.automatic_partial_collection.min_stale_rows	integer	100	target minimum number of stale rows per table that will trigger a partial statistics refresh	application
 sql.stats.cleanup.recurrence	string	@hourly	cron-tab recurrence for SQL Stats cleanup job	application
+sql.stats.detailed_latency_metrics.enabled	boolean	false	label latency metrics with the statement fingerprint. Workloads with tens of thousands of distinct query fingerprints should leave this setting false. (experimental, affects performance for workloads with high fingerprint cardinality)	application
 sql.stats.flush.enabled	boolean	true	if set, SQL execution statistics are periodically flushed to disk	application
 sql.stats.flush.interval	duration	10m0s	the interval at which SQL execution statistics are flushed to disk, this value must be less than or equal to 1 hour	application
 sql.stats.forecasts.enabled	boolean	true	when true, enables generation of statistics forecasts by default for all tables	application
@@ -359,6 +359,7 @@ sql.stats.histogram_collection.enabled	boolean	true	histogram collection mode	ap
 sql.stats.histogram_samples.count	integer	0	number of rows sampled for histogram construction during table statistics collection. Not setting this or setting a value of 0 means that a reasonable sample size will be automatically picked based on the table size.	application
 sql.stats.multi_column_collection.enabled	boolean	true	multi-column statistics collection mode	application
 sql.stats.non_default_columns.min_retention_period	duration	24h0m0s	minimum retention period for table statistics collected on non-default columns	application
+sql.stats.non_indexed_json_histograms.enabled	boolean	false	set to true to collect table statistics histograms on non-indexed JSON columns	application
 sql.stats.persisted_rows.max	integer	1000000	maximum number of rows of statement and transaction statistics that will be persisted in the system tables before compaction begins	application
 sql.stats.post_events.enabled	boolean	false	if set, an event is logged for every CREATE STATISTICS job	application
 sql.stats.response.max	integer	20000	the maximum number of statements and transaction stats returned in a CombinedStatements request	application
@@ -403,4 +404,4 @@ trace.span_registry.enabled	boolean	false	if set, ongoing traces can be seen at 
 trace.zipkin.collector	string		the address of a Zipkin instance to receive traces, as <host>:<port>. If no port is specified, 9411 will be used.	application
 ui.database_locality_metadata.enabled	boolean	true	if enabled shows extended locality data about databases and tables in DB Console which can be expensive to compute	application
 ui.display_timezone	enumeration	etc/utc	the timezone used to format timestamps in the ui [etc/utc = 0, america/new_york = 1]	application
-version	version	1000024.3-upgrading-to-1000025.1-step-018	set the active cluster version in the format '<major>.<minor>'	application
+version	version	1000025.1-upgrading-to-1000025.2-step-002	set the active cluster version in the format '<major>.<minor>'	application

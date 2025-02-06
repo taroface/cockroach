@@ -640,6 +640,12 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	}
 	if mem.Metadata().HasUserDefinedRoutines() {
 		// Get all relevant user-defined routines.
+		//
+		// Note that we first populate fast int set so that we add routines in
+		// increasing order of Oids to the bundle. This should allow for easier
+		// recreation when we have dependencies between routines since _usually_
+		// smaller Oid would indicate an older routine which makes it less
+		// likely to depend on another routine.
 		var ids intsets.Fast
 		isProcedure := make(map[oid.Oid]bool)
 		mem.Metadata().ForEachUserDefinedRoutine(func(ol *tree.Overload) {
@@ -816,6 +822,8 @@ func init() {
 	binarySVForBundle = &st.SV
 }
 
+var anyWhitespace = regexp.MustCompile(`\s+`)
+
 // PrintSessionSettings appends information about all session variables that
 // differ from their defaults.
 //
@@ -894,7 +902,7 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer, sv *settings.Values
 		if skip && !all {
 			continue
 		}
-		if _, ok := sessionVarNeedsEscaping[varName]; ok {
+		if _, ok := sessionVarNeedsEscaping[varName]; ok || anyWhitespace.MatchString(value) {
 			value = lexbase.EscapeSQLString(value)
 		}
 		if value == "" {

@@ -24,7 +24,9 @@ import "server/status/statuspb/status.proto";
 import "sql/appstatspb/app_stats.proto";
 import "sql/contentionpb/contention.proto";
 import "sql/sqlstats/insights/insights.proto";
+import "storage/enginepb/key_registry.proto";
 import "storage/enginepb/mvcc.proto";
+import "storage/enginepb/stats.proto";
 import "kv/kvserver/kvserverpb/lease_status.proto";
 import "kv/kvserver/kvserverpb/state.proto";
 import "kv/kvserver/liveness/livenesspb/liveness.proto";
@@ -391,11 +393,12 @@ message RACStatus {
   message Stream {
     uint64 index_to_send = 1;
     uint64 next_raft_index_initial = 2;
-    uint64 next_raft_index = 3;
     uint64 force_flush_stop_index = 4;
 
     repeated int64 eval_tokens_held = 5;
     repeated int64 send_tokens_held = 6;
+
+    reserved 3;
   }
   map<uint64, Stream> streams = 6 [ (gogoproto.nullable) = false ];
 }
@@ -1653,7 +1656,7 @@ message StoreDetails {
   // - encryption settings
 
   // encryption_status is a serialized
-  // ccl/storageccl/engineccl/enginepbccl/stats.go::EncryptionStatus protobuf.
+  // storage/enginepb/stats.go::EncryptionStatus protobuf.
   bytes encryption_status = 2;
 
   // Basic file stats when encryption is enabled.
@@ -1756,12 +1759,15 @@ enum StatsSortOptions {
   SERVICE_LAT = 0;
   CPU_TIME = 1;
   EXECUTION_COUNT = 2;
-  P99_STMTS_ONLY = 3;
+  reserved 3;
+  reserved "P99_STMTS_ONLY";
   CONTENTION_TIME = 4;
   PCT_RUNTIME = 5;
+  reserved 6;
+  reserved "LATENCY_INFO_P50";
+  reserved 7;
+  reserved "LATENCY_INFO_P90";
   // Sort options only available on default stats tables.
-  LATENCY_INFO_P50 = 6;
-  LATENCY_INFO_P90 = 7;
   LATENCY_INFO_MIN = 8;
   LATENCY_INFO_MAX = 9;
   ROWS_PROCESSED = 10;

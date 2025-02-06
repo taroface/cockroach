@@ -61,6 +61,7 @@ var sysbenchWorkloadName = map[sysbenchWorkload]string{
 type extraSetup struct {
 	nameSuffix string
 	stmts      []string
+	useDRPC    bool
 }
 
 func (w sysbenchWorkload) String() string {
@@ -150,7 +151,12 @@ func runSysbench(ctx context.Context, t test.Test, c cluster.Cluster, opts sysbe
 		}
 	} else {
 		t.Status("installing cockroach")
-		c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), install.MakeClusterSettings(), c.CRDBNodes())
+		settings := install.MakeClusterSettings()
+		if opts.extra.useDRPC {
+			settings.Env = append(settings.Env, "COCKROACH_EXPERIMENTAL_DRPC_ENABLED=true")
+			t.L().Printf("extra setup to use DRPC")
+		}
+		c.Start(ctx, t.L(), option.NewStartOpts(option.NoBackupSchedule), settings, c.CRDBNodes())
 		if len(c.CRDBNodes()) >= 3 {
 			err := roachtestutil.WaitFor3XReplication(ctx, t.L(), c.Conn(ctx, t.L(), 1))
 			require.NoError(t, err)
@@ -185,12 +191,21 @@ func runSysbench(ctx context.Context, t test.Test, c cluster.Cluster, opts sysbe
 	var start time.Time
 	runWorkload := func(ctx context.Context) error {
 		t.Status("preparing workload")
-		c.Run(ctx, option.WithNodes(c.WorkloadNode()), opts.cmd(true /* haproxy */)+" prepare")
+		cmd := opts.cmd(useHAProxy /* haproxy */)
+		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.WorkloadNode()), cmd+" prepare")
+		if err != nil {
+			return err
+		} else if strings.Contains(result.Stdout, "FATAL") {
+			// sysbench prepare doesn't exit on errors for some reason, so we have
+			// to check that it didn't silently fail. We've seen it do so, causing
+			// the run step to segfault. Segfaults are an ignored error, so in the
+			// past, this would cause the test to silently fail.
+			return errors.Newf("sysbench prepare failed with FATAL error")
+		}
 
 		t.Status("running workload")
-		cmd := opts.cmd(useHAProxy /* haproxy */) + " run"
 		start = timeutil.Now()
-		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.WorkloadNode()), cmd)
+		result, err = c.RunWithDetailsSingleNode(ctx, t.L(), option.WithNodes(c.WorkloadNode()), cmd+" run")
 
 		// Sysbench occasionally segfaults. When that happens, don't fail the
 		// test.
@@ -241,12 +256,18 @@ func registerSysbench(r registry.Registry) {
 		{n: 1, cpus: 32},
 		{n: 3, cpus: 32},
 		{n: 3, cpus: 8, pick: coreThree},
-		{n: 3, cpus: 8, pick: coreThree, extra: extraSetup{nameSuffix: "-settings", stmts: []string{
-			`set cluster setting sql.stats.flush.enabled = false`,
-			`set cluster setting sql.metrics.statement_details.enabled = false`,
-			`set cluster setting kv.split_queue.enabled = false`,
-			`set cluster setting sql.stats.histogram_collection.enabled = false`,
-			`set cluster setting kv.consistency_queue.enabled = false`}},
+		{n: 3, cpus: 8, pick: coreThree,
+			extra: extraSetup{
+				nameSuffix: "-settings",
+				stmts: []string{
+					`set cluster setting sql.stats.flush.enabled = false`,
+					`set cluster setting sql.metrics.statement_details.enabled = false`,
+					`set cluster setting kv.split_queue.enabled = false`,
+					`set cluster setting sql.stats.histogram_collection.enabled = false`,
+					`set cluster setting kv.consistency_queue.enabled = false`,
+				},
+				useDRPC: true,
+			},
 		},
 	} {
 		for w := sysbenchWorkload(0); w < numSysbenchWorkloads; w++ {
@@ -268,6 +289,7 @@ func registerSysbench(r registry.Registry) {
 			if d.extra.nameSuffix != "" {
 				benchname += d.extra.nameSuffix
 			}
+
 			r.Add(registry.TestSpec{
 				Name:                      fmt.Sprintf("%s/%s/nodes=%d/cpu=%d/conc=%d", benchname, w, d.n, d.cpus, conc),
 				Benchmark:                 true,

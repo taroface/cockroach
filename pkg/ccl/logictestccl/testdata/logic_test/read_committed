@@ -317,6 +317,9 @@ subtest schema_changes_multi-stmt
 # They are allowed in single-statement explicit transactions.
 
 statement ok
+SET autocommit_before_ddl = false
+
+statement ok
 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 CREATE TABLE single_stmt_explicit (a INT PRIMARY KEY);
 COMMIT
@@ -474,6 +477,9 @@ ALTER SCHEMA s RENAME TO foo;
 statement ok
 ROLLBACK
 
+statement ok
+RESET autocommit_before_ddl
+
 subtest end
 
 statement ok
@@ -483,10 +489,20 @@ SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE
 
 statement ok
 CREATE USER testuser2 WITH VIEWACTIVITY;
+
+statement ok
 DROP TABLE IF EXISTS t;
+
+statement ok
 CREATE TABLE t(a INT PRIMARY KEY);
+
+statement ok
 INSERT INTO t VALUES(1), (2);
+
+statement ok
 GRANT ALL ON t TO testuser;
+
+statement ok
 GRANT ALL ON t TO testuser2;
 
 user testuser

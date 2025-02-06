@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/leases"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -180,17 +181,7 @@ func (b *propBuf) Init(
 	b.clock = clock
 	b.evalTracker = tracker
 	b.settings = settings
-	b.assignedLAI = p.leaseAppliedIndex()
-
-	// Reserve LAI 1 for out-of-order proposals in tests. A bunch of tests
-	// override proposal's LAI to 1, in order to force reproposals. If these
-	// modified proposals race with a "real" proposal with LAI 1, this can cause a
-	// closed timestamp regression.
-	//
-	// https://github.com/cockroachdb/cockroach/issues/70894#issuecomment-1881165404
-	if b.testing.leaseIndexFilter != nil {
-		b.forwardAssignedLAILocked(1)
-	}
+	b.assignedLAI = max(p.leaseAppliedIndex(), stateloader.InitialLeaseAppliedIndex)
 }
 
 // AllocatedIdx returns the highest index that was allocated. This generally
@@ -934,11 +925,13 @@ func maybeDeductFlowTokens(
 			// free up all tracked tokens as a result of this leadership change.
 			return
 		}
-		log.VInfof(ctx, 1, "bound index/log terms for proposal entry: %s",
-			raft.DescribeEntry(ents[i], func(bytes []byte) string {
-				return "<omitted>"
-			}),
-		)
+		if log.ExpensiveLogEnabled(ctx, 1) {
+			log.VInfof(ctx, 1, "bound index/log terms for proposal entry: %s",
+				raft.DescribeEntry(ents[i], func(bytes []byte) string {
+					return "<omitted>"
+				}),
+			)
+		}
 		h.DeductTokensFor(
 			admitHandle.pCtx,
 			admissionpb.WorkPriority(admitHandle.handle.AdmissionPriority),
@@ -1285,6 +1278,7 @@ func (rp *replicaProposer) verifyLeaseRequestSafetyRLocked(
 		PrevLeaseExpired:   !r.ownsValidLeaseRLocked(ctx, r.Clock().NowAsClockTimestamp()),
 		NextLeaseHolder:    nextLease.Replica,
 		BypassSafetyChecks: bypassSafetyChecks,
+		DesiredLeaseType:   r.desiredLeaseTypeRLocked(),
 	}
 	if err := leases.Verify(ctx, st, in); err != nil {
 		if in.Transfer() {

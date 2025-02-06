@@ -108,7 +108,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/redact"
-	pgx "github.com/jackc/pgx/v4"
+	pgx "github.com/jackc/pgx/v5"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2700,6 +2700,8 @@ func TestBackupRestoreDuringUserDefinedTypeChange(t *testing.T) {
 				defer cleanupFn()
 
 				// Create a database with a type.
+				sqlDB.Exec(t, "SET CLUSTER SETTING sql.defaults.autocommit_before_ddl.enabled = false")
+				sqlDB.Exec(t, "SET autocommit_before_ddl = false")
 				sqlDB.Exec(t, `
 CREATE DATABASE d;
 CREATE TYPE d.greeting AS ENUM ('hello', 'howdy', 'hi');
@@ -4723,7 +4725,7 @@ func TestRestoreDatabaseVersusTable(t *testing.T) {
 	tc, origDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 	s := tc.ApplicationLayer(0)
-	args := base.TestServerArgs{ExternalIODir: s.ClusterSettings().ExternalIODir}
+	args := base.TestServerArgs{ExternalIODir: s.ExternalIODir()}
 
 	for _, q := range []string{
 		`CREATE DATABASE d2`,
@@ -7393,6 +7395,8 @@ func TestClientDisconnect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.UnderRace(t, "may cause connection delays, leading to a context deadline exceeded error")
+
 	const restoreDB = "restoredb"
 
 	testCases := []struct {
@@ -7485,7 +7489,9 @@ func TestClientDisconnect(t *testing.T) {
 				assert.NoError(t, err)
 				defer func() { assert.NoError(t, db.Close(ctx)) }()
 				_, err = db.Exec(ctxToCancel, command)
-				assert.Equal(t, context.Canceled, errors.Unwrap(err))
+				// Check the root cause of the error, as pgx v5 may wrap additional
+				// errors around a context-canceled error.
+				assert.Equal(t, context.Canceled, errors.Cause(err))
 			}(testCase.jobCommand)
 
 			// Wait for the job to start.
@@ -11082,6 +11088,7 @@ func TestBackupRestoreForeignKeys(t *testing.T) {
 
 	sqlDB.Exec(t, `CREATE DATABASE test`)
 	sqlDB.Exec(t, `SET database = test`)
+	sqlDB.Exec(t, `SET autocommit_before_ddl = false`)
 	sqlDB.Exec(t, `
 CREATE TABLE circular (k INT8 PRIMARY KEY, selfid INT8 UNIQUE);
 ALTER TABLE circular ADD CONSTRAINT self_fk FOREIGN KEY (selfid) REFERENCES circular (selfid);
@@ -11089,6 +11096,7 @@ CREATE TABLE parent (k INT8 PRIMARY KEY, j INT8 UNIQUE);
 CREATE TABLE child (k INT8 PRIMARY KEY, parent_i INT8 REFERENCES parent, parent_j INT8 REFERENCES parent (j));
 CREATE TABLE child_pk (k INT8 PRIMARY KEY REFERENCES parent);
 `)
+	sqlDB.Exec(t, `RESET autocommit_before_ddl`)
 
 	sqlDB.Exec(t, `BACKUP INTO $1 WITH revision_history`, localFoo)
 

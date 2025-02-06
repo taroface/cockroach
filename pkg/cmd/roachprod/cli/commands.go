@@ -1117,7 +1117,7 @@ func buildSSHKeysListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "list every SSH public key installed on clusters managed by roachprod",
 		Run: wrap(func(cmd *cobra.Command, args []string) error {
-			authorizedKeys, err := gce.GetUserAuthorizedKeys()
+			authorizedKeys, err := gce.Infrastructure.GetUserAuthorizedKeys()
 			if err != nil {
 				return err
 			}
@@ -1168,7 +1168,7 @@ func buildSSHKeysRemoveCmd() *cobra.Command {
 		Run: wrap(func(cmd *cobra.Command, args []string) error {
 			user := args[0]
 
-			existingKeys, err := gce.GetUserAuthorizedKeys()
+			existingKeys, err := gce.Infrastructure.GetUserAuthorizedKeys()
 			if err != nil {
 				return fmt.Errorf("failed to fetch existing keys: %w", err)
 			}
@@ -1935,6 +1935,11 @@ func buildSnapshotApplyCmd() *cobra.Command {
 	}
 }
 
+func roachprodUpdateSupported(goos, goarch string) bool {
+	// We only have prebuilt binaries for Linux. See #120750.
+	return goos == "linux"
+}
+
 func (cr *commandRegistry) buildUpdateCmd() *cobra.Command {
 	updateCmd := &cobra.Command{
 		Use:   "update",
@@ -1944,8 +1949,8 @@ func (cr *commandRegistry) buildUpdateCmd() *cobra.Command {
 			" and can be restored via `roachprod update --revert`.",
 		Run: wrap(func(cmd *cobra.Command, args []string) error {
 			// We only have prebuilt binaries for Linux. See #120750.
-			if runtime.GOOS != "linux" {
-				return errors.New("this command is only available on Linux at this time")
+			if !roachprodUpdateSupported(runtime.GOOS, runtime.GOARCH) {
+				return errors.Errorf("this command is not available on %s/%s at this time", runtime.GOOS, runtime.GOARCH)
 			}
 
 			currentBinary, err := os.Executable()

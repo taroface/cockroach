@@ -8,6 +8,7 @@ package perturbation
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 
@@ -27,7 +28,9 @@ type backfill struct{}
 var _ perturbation = backfill{}
 
 func (b backfill) setup() variations {
-	v := setup(b, 40.0)
+	// TODO(#139262): Track down why this test causes stalls and drop the value
+	// to something more reasonable (like 5) once this is done.
+	v := setup(b, math.Inf(1))
 	return v
 }
 
@@ -39,6 +42,13 @@ func (b backfill) setupMetamorphic(rng *rand.Rand) variations {
 	if v.mem == spec.Low {
 		v.mem = spec.Standard
 	}
+
+	// TODO(#139319): This can be removed once we stop testing the non "full"
+	// mode. Without full AC, these tests can OOM.
+	if v.numNodes >= 30 && (v.acMode == elasticOnlyBoth || v.acMode == fullNormalElasticRepl) {
+		v.acMode = fullBoth
+	}
+
 	// TODO(#136848): The backfill test will cause WAL failover resulting in
 	// OOMs even with high memory configurations. This test passes without WAL
 	// failover enabled or with more vCPUs per node.

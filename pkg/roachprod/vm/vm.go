@@ -353,13 +353,6 @@ type ProviderOpts interface {
 	// ConfigureCreateFlags configures a FlagSet with any options relevant to the
 	// `create` command.
 	ConfigureCreateFlags(*pflag.FlagSet)
-	// ConfigureClusterFlags configures a FlagSet with any options relevant to
-	// cluster manipulation commands (`create`, `destroy`, `list`, `sync` and
-	// `gc`).
-	ConfigureClusterFlags(*pflag.FlagSet, MultipleProjectsOption)
-	// ConfigureClusterCleanupFlags configures a FlagSet with any options relevant to
-	// commands (`gc`)
-	ConfigureClusterCleanupFlags(*pflag.FlagSet)
 }
 
 // VolumeSnapshot is an abstract representation of a specific volume snapshot.
@@ -468,6 +461,14 @@ type ServiceAddress struct {
 
 // A Provider is a source of virtual machines running on some hosting platform.
 type Provider interface {
+	// ConfigureProviderFlags is used to specify flags that apply to the provider
+	// instance and should be used for all clusters managed by the provider.
+	ConfigureProviderFlags(*pflag.FlagSet, MultipleProjectsOption)
+
+	// ConfigureClusterCleanupFlags configures a FlagSet with any options
+	// relevant to commands (`gc`)
+	ConfigureClusterCleanupFlags(*pflag.FlagSet)
+
 	CreateProviderOpts() ProviderOpts
 	CleanSSH(l *logger.Logger) error
 
@@ -621,7 +622,9 @@ func FindActiveAccounts(l *logger.Logger) (map[string]string, error) {
 		err := ProvidersSequential(AllProviderNames(), func(p Provider) error {
 			account, err := p.FindActiveAccount(l)
 			if err != nil {
-				return err
+				l.Printf("WARN: provider=%q has no active account", p.Name())
+				//nolint:returnerrcheck
+				return nil
 			}
 			if len(account) > 0 {
 				source[p.Name()] = account

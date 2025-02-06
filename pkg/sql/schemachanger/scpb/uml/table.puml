@@ -302,6 +302,16 @@ object Policy
 
 Policy :  TableID
 Policy :  PolicyID
+Policy :  Type
+Policy :  Command
+
+object PolicyDeps
+
+PolicyDeps :  TableID
+PolicyDeps :  PolicyID
+PolicyDeps : []UsesTypeIDs
+PolicyDeps : []UsesRelationIDs
+PolicyDeps : []UsesFunctionIDs
 
 object PolicyName
 
@@ -309,9 +319,36 @@ PolicyName :  TableID
 PolicyName :  PolicyID
 PolicyName :  Name
 
+object PolicyRole
+
+PolicyRole :  TableID
+PolicyRole :  PolicyID
+PolicyRole :  RoleName
+
+object PolicyUsingExpr
+
+PolicyUsingExpr :  TableID
+PolicyUsingExpr :  PolicyID
+PolicyUsingExpr :  Expression
+
+object PolicyWithCheckExpr
+
+PolicyWithCheckExpr :  TableID
+PolicyWithCheckExpr :  PolicyID
+PolicyWithCheckExpr :  Expression
+
 object PrimaryIndex
 
 PrimaryIndex :  Index
+
+object RowLevelSecurityEnabled
+
+RowLevelSecurityEnabled :  TableID
+
+object RowLevelSecurityForced
+
+RowLevelSecurityForced :  TableID
+RowLevelSecurityForced :  IsForced
 
 object RowLevelTTL
 
@@ -588,9 +625,15 @@ AliasType <|-- Owner
 EnumType <|-- Owner
 TablePartitioning <|-- PartitionZoneConfig
 Table <|-- Policy
+Policy <|-- PolicyDeps
 Policy <|-- PolicyName
+Policy <|-- PolicyRole
+Policy <|-- PolicyUsingExpr
+Policy <|-- PolicyWithCheckExpr
 Table <|-- PrimaryIndex
 View <|-- PrimaryIndex
+Table <|-- RowLevelSecurityEnabled
+Table <|-- RowLevelSecurityForced
 Table <|-- RowLevelTTL
 AliasType <|-- SchemaChild
 EnumType <|-- SchemaChild

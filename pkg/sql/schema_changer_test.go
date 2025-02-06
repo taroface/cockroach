@@ -473,6 +473,7 @@ CREATE TABLE d.t1 (val INT DEFAULT nextval('d.sq1'), animal d.animals);
 	// This view creation will fail and eventually rollback.
 	_, err = sqlDB.Exec(
 		`BEGIN;
+SET LOCAL autocommit_before_ddl = false;
 CREATE MATERIALIZED VIEW d.v AS SELECT val FROM d.t1;
 CREATE VIEW d.v1 AS SELECT A.val AS  val2, B.val AS val1, 'cat':::d.animals AS ANIMAL, c.last_value FROM d.v AS A, d.t1 AS B, d.sq1 as C;
 COMMIT;`)
@@ -822,6 +823,17 @@ func TestDropWhileBackfill(t *testing.T) {
 `); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := sqlDB.Exec(`
+	ALTER ROLE ALL SET autocommit_before_ddl = 'false';
+`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec(`
+	SET autocommit_before_ddl = 'false';
+`); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := sqlDB.Exec(`
 SET use_declarative_schema_changer = 'off';
 CREATE DATABASE t;
@@ -1342,6 +1354,9 @@ CREATE TABLE t.test (
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := txn.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := txn.Exec(`ALTER TABLE t.test ADD CONSTRAINT check_bk CHECK (b >= k)`); err != nil {
 		t.Fatal(err)
 	}
@@ -1597,116 +1612,6 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	dropColumnSchemaChange(t, sqlDB, kvDB, codec, maxValue, 2)
 	if num := atomic.SwapUint32(&numBackfills, 0); num != 2 {
 		t.Fatalf("expected %d backfills, but saw %d", 2, num)
-	}
-}
-
-// Test schema change purge failure doesn't leave DB in a bad state.
-func TestSchemaChangePurgeFailure(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	for _, schemaChangerSetup := range []string{
-		"SET use_declarative_schema_changer='off'",
-		"SET use_declarative_schema_changer='on'",
-	} {
-		params, _ := createTestServerParams()
-		const chunkSize = 200
-
-		var getKeyCount func() (int, error)
-		countBeforeRollback := 0
-		params.Knobs = base.TestingKnobs{
-			SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
-				RunBeforeOnFailOrCancel: func(jobID jobspb.JobID) error {
-					cnt, err := getKeyCount()
-					if err != nil {
-						return err
-					}
-					countBeforeRollback = cnt
-					return nil
-				},
-			},
-			DistSQL: &execinfra.TestingKnobs{
-				BulkAdderFlushesEveryBatch: true,
-			},
-			SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
-				RunBeforeMakingPostCommitPlan: func(inRollback bool) error {
-					if inRollback {
-						cnt, err := getKeyCount()
-						if err != nil {
-							return err
-						}
-						countBeforeRollback = cnt
-					}
-					return nil
-				},
-			},
-		}
-		server, sqlDB, kvDB := serverutils.StartServer(t, params)
-		defer server.Stopper().Stop(context.Background())
-		codec := server.ApplicationLayer().Codec()
-
-		_, err := sqlDB.Exec(fmt.Sprintf("SET CLUSTER SETTING bulkio.index_backfill.batch_size = %d", chunkSize))
-		require.NoError(t, err)
-
-		getKeyCount = func() (int, error) {
-			return sqltestutils.GetTableKeyCount(ctx, kvDB, codec)
-		}
-		// Disable strict GC TTL enforcement because we're going to shove a zero-value
-		// TTL into the system with AddImmediateGCZoneConfig.
-		defer sqltestutils.DisableGCTTLStrictEnforcement(t, sqlDB)()
-
-		_, err = sqlDB.Exec(schemaChangerSetup)
-		require.NoError(t, err)
-
-		if _, err := sqlDB.Exec(`
-CREATE DATABASE t;
-CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
-`); err != nil {
-			t.Fatal(err)
-		}
-
-		// Bulk insert.
-		const maxValue = chunkSize + 1
-		if err := sqltestutils.BulkInsertIntoTable(sqlDB, maxValue); err != nil {
-			t.Fatal(err)
-		}
-
-		// Add a row with a duplicate value=0 which is the same
-		// value as for the key maxValue.
-		if _, err := sqlDB.Exec(
-			`INSERT INTO t.test VALUES ($1, $2)`, maxValue+1, 0,
-		); err != nil {
-			t.Fatal(err)
-		}
-
-		// A schema change that violates integrity constraints.
-		if _, err := sqlDB.Exec(
-			"CREATE UNIQUE INDEX foo ON t.test (v)",
-		); !testutils.IsError(err, `violates unique constraint "foo"`) {
-			t.Fatal(err)
-		}
-
-		// The index doesn't exist
-		if _, err := sqlDB.Query(
-			`SELECT v from t.test@foo`,
-		); !testutils.IsError(err, "index .* not found") {
-			t.Fatal(err)
-		}
-
-		// countBeforeRollback is assigned in the rollback testing knob which is
-		// called before rollback starts so that the first chunk (200 keys) written
-		// is still visible. The first chunk is visible because there is no
-		// duplicate keys within it. The duplicate keys only exist in the second
-		// chunk. Also note that we wrote maxValue+1 rows, and there is 1 extra key
-		// from kv.
-		require.Equal(t, countBeforeRollback, maxValue+2+chunkSize)
-
-		// No garbage left behind after rollback. This check should succeed pretty
-		// fast since we use `DelRange` in GC and `CheckTableKeyCount` cannot see
-		// tombstones.
-		testutils.SucceedsSoon(t, func() error {
-			return sqltestutils.CheckTableKeyCount(ctx, kvDB, codec, 1, maxValue+1)
-		})
 	}
 }
 
@@ -2124,6 +2029,8 @@ INSERT INTO t VALUES (1, 1, 1), (2, 2, 1);
 	require.NoError(t, err)
 
 	txn, err := sqlDB.Begin()
+	require.NoError(t, err)
+	_, err = txn.Exec("SET LOCAL autocommit_before_ddl = false")
 	require.NoError(t, err)
 
 	_, err = txn.Exec("DROP INDEX index_to_drop")
@@ -3681,6 +3588,9 @@ INSERT INTO t.kv VALUES ('a', 'b');
 			if err != nil {
 				t.Fatal(err)
 			}
+			if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
+				t.Fatal(err)
+			}
 
 			if _, err := tx.Exec(testCase.firstStmt); err != nil {
 				t.Fatal(err)
@@ -4346,6 +4256,10 @@ CREATE DATABASE t;
 		t.Fatal(err)
 	}
 
+	if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := tx.Exec(`CREATE TABLE t.testing (k INT PRIMARY KEY, v INT, INDEX foo(v), CONSTRAINT ck_k CHECK (k >= 0));`); err != nil {
 		t.Fatal(err)
 	}
@@ -4607,65 +4521,6 @@ func TestCancelSchemaChange(t *testing.T) {
 	tableDesc = desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	if checks := tableDesc.CheckConstraints(); len(checks) != 1 {
 		t.Fatalf("expected 1 check, found %+v", checks)
-	}
-}
-
-// This test checks that when a transaction containing schema changes
-// needs to be retried it gets retried internal to cockroach. This test
-// currently fails because a schema change transaction is not retried.
-func TestSchemaChangeRetryError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	const numNodes = 3
-
-	params, _ := createTestServerParams()
-
-	tc := serverutils.StartCluster(t, numNodes,
-		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
-			ServerArgs:      params,
-		})
-	defer tc.Stopper().Stop(context.Background())
-	sqlDB := tc.ServerConn(0)
-
-	if _, err := sqlDB.Exec(`
- CREATE DATABASE t;
- CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
- `); err != nil {
-		t.Fatal(err)
-	}
-
-	tx, err := sqlDB.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The timestamp of the transaction is guaranteed to be fixed after
-	// this statement.
-	if _, err := tx.Exec(`
-		CREATE TABLE t.another (k INT PRIMARY KEY, v INT, pi DECIMAL DEFAULT (DECIMAL '3.14'));
-		`); err != nil {
-		t.Fatal(err)
-	}
-
-	otherSQLDB := tc.ServerConn(1)
-
-	// Read schema on another node that picks a later timestamp.
-	rows, err := otherSQLDB.Query("SELECT * FROM t.test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows.Close()
-
-	if _, err := tx.Exec(`
-		CREATE UNIQUE INDEX vidx ON t.test (v);
-		`); err != nil {
-		t.Fatal(err)
-	}
-
-	// The transaction should get pushed and commit without an error.
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -5060,6 +4915,9 @@ CREATE TABLE t.test (a INT, b INT, c JSON, d JSON);
 	// Start schema changes.
 	tx, err := sqlDB.Begin()
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`SET LOCAL autocommit_before_ddl = false`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(`CREATE INDEX idx_a ON t.test (a)`); err != nil {
@@ -6412,12 +6270,9 @@ func TestRollbackForeignKeyAddition(t *testing.T) {
 
 	var jobID jobspb.JobID
 
-	// We filter by descriptor_ids because there's a bug where we create an extra
+	// We filter by running because there's a bug where we create an extra
 	// no-op job for the referenced table (#57624).
-	require.NoError(t, sqlDB.QueryRow(`
-SELECT job_id FROM crdb_internal.jobs WHERE description LIKE '%ALTER TABLE%'
-AND descriptor_ids[1] = 'db.t2'::regclass::int`,
-	).Scan(&jobID))
+	require.NoError(t, sqlDB.QueryRow(`SELECT job_id FROM crdb_internal.jobs WHERE description LIKE '%ALTER TABLE%' AND status = 'running'`).Scan(&jobID))
 	tdb.Exec(t, "CANCEL JOB $1", jobID)
 
 	close(continueNotification)
@@ -7632,12 +7487,8 @@ func TestConcurrentSchemaChangesDoNotDeadlock(t *testing.T) {
 		}
 		for i := 0; i < runs; i++ {
 			// We don't really care whether we use the declarative schema changer or
-			// not here. It's not currently supported for CREATE VIEW, so set it to
-			// on and let the system decide
-			if !runStmt(`
-SET use_declarative_schema_changer = on;
-CREATE VIEW IF NOT EXISTS v AS SELECT i FROM t
-`) {
+			// not here.
+			if !runStmt(`CREATE VIEW IF NOT EXISTS v AS SELECT i FROM t`) {
 				return
 			}
 			rows, err := conn.QueryContext(ctx, `SELECT * FROM v`)
@@ -7657,12 +7508,8 @@ CREATE VIEW IF NOT EXISTS v AS SELECT i FROM t
 				return
 			}
 			// Note that this is primarily about testing the behavior of this drop
-			// with the declarative schema changer, so we make that explicit. It
-			// would be used anyway, but no reason to leave it to policy.
-			if !runStmt(`
-SET use_declarative_schema_changer = unsafe;
-DROP VIEW IF EXISTS v
-`) {
+			// with the declarative schema changer.
+			if !runStmt(`DROP VIEW IF EXISTS v`) {
 				return
 			}
 		}
@@ -7851,10 +7698,14 @@ func TestLeaseTimeoutWithConcurrentTransactions(t *testing.T) {
 	sqlRunner.Exec(t, `CREATE TABLE RIDES (my_int INT);`)
 
 	txn1 := sqlRunner.Begin(t)
-	_, err := txn1.Exec(`SELECT * FROM PROMO_CODES;`)
+	_, err := txn1.Exec(`SET LOCAL autocommit_before_ddl = false;`)
+	require.NoError(t, err)
+	_, err = txn1.Exec(`SELECT * FROM PROMO_CODES;`)
 	require.NoError(t, err)
 
 	txn2 := sqlRunner.Begin(t)
+	_, err = txn2.Exec(`SET LOCAL autocommit_before_ddl = false;`)
+	require.NoError(t, err)
 	_, err = txn2.Exec(`GRANT ALL ON TABLE PROMO_CODES TO ROACHMIN;`)
 	require.NoError(t, err)
 	_, err = txn2.Exec(`GRANT ALL ON TABLE RIDES TO ROACHMIN;`)

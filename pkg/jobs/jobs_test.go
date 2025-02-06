@@ -1740,7 +1740,6 @@ func TestShowJobs(t *testing.T) {
 		username          username.SQLUsername
 		err               string
 		created           time.Time
-		started           time.Time
 		finished          time.Time
 		modified          time.Time
 		fractionCompleted float32
@@ -1752,19 +1751,15 @@ func TestShowJobs(t *testing.T) {
 	const instanceID = 7
 	for _, in := range []row{
 		{
-			id:          42,
-			typ:         "SCHEMA CHANGE",
-			status:      "superfailed",
-			description: "failjob",
-			username:    username.MakeSQLUsernameFromPreNormalizedString("failure"),
-			err:         "boom",
-			// lib/pq returns time.Time objects with goofy locations, which breaks
-			// reflect.DeepEqual without this time.FixedZone song and dance.
-			// See: https://github.com/lib/pq/issues/329
-			created:           timeutil.Unix(1, 0).In(time.FixedZone("", 0)),
-			started:           timeutil.Unix(2, 0).In(time.FixedZone("", 0)),
-			finished:          timeutil.Unix(3, 0).In(time.FixedZone("", 0)),
-			modified:          timeutil.Unix(4, 0).In(time.FixedZone("", 0)),
+			id:                42,
+			typ:               "SCHEMA CHANGE",
+			status:            "superfailed",
+			description:       "failjob",
+			username:          username.MakeSQLUsernameFromPreNormalizedString("failure"),
+			err:               "boom",
+			created:           timeutil.Unix(1, 0),
+			finished:          timeutil.Unix(3, 0),
+			modified:          timeutil.Unix(4, 0),
 			fractionCompleted: 0.42,
 			coordinatorID:     instanceID,
 			details:           jobspb.SchemaChangeDetails{},
@@ -1776,13 +1771,9 @@ func TestShowJobs(t *testing.T) {
 			description: "persistent feed",
 			username:    username.MakeSQLUsernameFromPreNormalizedString("persistent"),
 			err:         "",
-			// lib/pq returns time.Time objects with goofy locations, which breaks
-			// reflect.DeepEqual without this time.FixedZone song and dance.
-			// See: https://github.com/lib/pq/issues/329
-			created:  timeutil.Unix(1, 0).In(time.FixedZone("", 0)),
-			started:  timeutil.Unix(2, 0).In(time.FixedZone("", 0)),
-			finished: timeutil.Unix(3, 0).In(time.FixedZone("", 0)),
-			modified: timeutil.Unix(4, 0).In(time.FixedZone("", 0)),
+			created:     timeutil.Unix(1, 0),
+			finished:    timeutil.Unix(3, 0),
+			modified:    timeutil.Unix(4, 0),
 			highWater: hlc.Timestamp{
 				WallTime: 1533143242000000,
 				Logical:  4,
@@ -1796,7 +1787,6 @@ func TestShowJobs(t *testing.T) {
 			// row struct directly.
 			inPayload, err := protoutil.Marshal(&jobspb.Payload{
 				Description:    in.description,
-				StartedMicros:  in.started.UnixNano() / time.Microsecond.Nanoseconds(),
 				FinishedMicros: in.finished.UnixNano() / time.Microsecond.Nanoseconds(),
 				UsernameProto:  in.username.EncodeProto(),
 				Error:          in.err,
@@ -1823,9 +1813,12 @@ func TestShowJobs(t *testing.T) {
 				t.Fatal(err)
 			}
 			sqlDB.Exec(t,
-				`INSERT INTO system.jobs (id, status, created, claim_session_id, claim_instance_id) VALUES ($1, $2, $3, $4, $5)`,
-				in.id, in.status, in.created, session.ID().UnsafeBytes(), instanceID,
+				`INSERT INTO system.jobs (id, status, job_type, owner, description, created, finished, error_msg, claim_session_id, claim_instance_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				in.id, in.status, in.typ, in.username.Normalized(), in.description, in.created, in.finished, in.err, session.ID().UnsafeBytes(), instanceID,
 			)
+			sqlDB.Exec(t, `INSERT INTO system.job_progress (job_id, written, resolved, fraction) VALUES ($1, $2, $3, $4)`, in.id, in.modified, in.highWater.AsOfSystemTime(), in.fractionCompleted)
+
+			// TODO(dt): delete these once sql.jobs.legacy_vtable.enabled is gone.
 			sqlDB.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, in.id, jobs.GetLegacyPayloadKey(), inPayload)
 			sqlDB.Exec(t, `INSERT INTO system.job_info (job_id, info_key, value) VALUES ($1, $2, $3)`, in.id, jobs.GetLegacyProgressKey(), inProgress)
 
@@ -1834,10 +1827,10 @@ func TestShowJobs(t *testing.T) {
 			var decimalHighWater *apd.Decimal
 			var resultUsername string
 			sqlDB.QueryRow(t, `
-      SELECT job_id, job_type, status, created, description, started, finished, modified,
+      SELECT job_id, job_type, status, created, description, finished, modified,
              fraction_completed, high_water_timestamp, user_name, ifnull(error, ''), coordinator_id
         FROM crdb_internal.jobs WHERE job_id = $1`, in.id).Scan(
-				&out.id, &out.typ, &out.status, &out.created, &out.description, &out.started,
+				&out.id, &out.typ, &out.status, &out.created, &out.description,
 				&out.finished, &out.modified, &maybeFractionCompleted, &decimalHighWater, &resultUsername,
 				&out.err, &out.coordinatorID,
 			)
@@ -1864,14 +1857,19 @@ func TestShowJobs(t *testing.T) {
 			if out.created.Equal(in.created) {
 				out.created = in.created
 			}
-			if out.started.Equal(in.started) {
-				out.started = in.started
-			}
 			if out.finished.Equal(in.finished) {
 				out.finished = in.finished
 			}
 			if out.modified.Equal(in.modified) {
 				out.modified = in.modified
+			}
+
+			// Locations don't compare well so nuke them.
+			for _, ts := range []*time.Time{&in.created, &in.finished, &in.modified} {
+				*ts = ts.UTC()
+			}
+			for _, ts := range []*time.Time{&out.created, &out.finished, &out.modified} {
+				*ts = ts.UTC()
 			}
 
 			if !reflect.DeepEqual(in, out) {
@@ -1988,152 +1986,6 @@ func TestShowAutomaticJobs(t *testing.T) {
 		t.Fatalf("Expected id:%d and type:%s but found id:%d and type:%s",
 			2, "AUTO CREATE STATS", out.id, out.typ)
 	}
-}
-
-func createJob(
-	ctx context.Context,
-	t *testing.T,
-	r *jobs.Registry,
-	id jobspb.JobID,
-	payloadBytes, progressBytes []byte,
-) {
-	var payload jobspb.Payload
-	var progress jobspb.Progress
-	require.NoError(t, protoutil.Unmarshal(payloadBytes, &payload))
-	require.NoError(t, protoutil.Unmarshal(progressBytes, &progress))
-	record := jobs.Record{
-		JobID:    id,
-		Username: username.TestUserName(),
-		Details:  payload.UnwrapDetails(),
-		Progress: progress.UnwrapDetails(),
-	}
-
-	_, err := r.CreateJobWithTxn(ctx, record, id, nil /* txn */)
-	require.NoError(t, err)
-}
-
-func TestShowJobsWithError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	var params base.TestServerArgs
-	params.Knobs.UpgradeManager = &upgradebase.TestingKnobs{
-		DontUseJobs:                       true,
-		SkipJobMetricsPollingJobBootstrap: true,
-	}
-	params.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{
-		SkipJobBootstrap: true,
-	}
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
-
-	// Ensure there is at least one row in system.job_info.
-	if _, err := sqlDB.Exec(`CREATE TABLE foo(x INT);`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(`ALTER TABLE foo ADD COLUMN y INT;`); err != nil {
-		t.Fatal(err)
-	}
-	// Get the id of the ADD COLUMN job to use later.
-	var jobID jobspb.JobID
-	var payload, progress []byte
-	if err := sqlDB.QueryRow(`
-SELECT id, payload, progress FROM "".crdb_internal.system_jobs ORDER BY id DESC LIMIT 1
-`).Scan(&jobID, &payload, &progress); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create 3 rows from the valid row, one of which is corrupted.
-	createJob(context.Background(), t, s.ApplicationLayer().JobRegistry().(*jobs.Registry), jobID+1, payload, progress)
-
-	// Create the second row with a corrupted progress field.
-	if _, err := sqlDB.Exec(`
-	INSERT INTO system.jobs(id, status) SELECT id+2, status FROM system.jobs WHERE id = $1;
-	`, jobID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(`
-	  -- Create a payload field from the most recent row.
-	  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+2, info_key, value FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_payload';
-	`, jobID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(`
-		  -- Create a corrupted progress field.
-		  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+2, info_key, '\xaaaa'::BYTES FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_progress';
-		`, jobID); err != nil {
-		t.Fatal(err)
-	}
-
-	// Test what happens with a NULL progress field (which is a valid value).
-	if _, err := sqlDB.Exec(`
-	INSERT INTO system.jobs(id, status) SELECT id+4, status FROM system.jobs WHERE id = $1;
-	`, jobID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(`
-	  -- Create a payload field from the most recent row.
-	  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+4, info_key, value FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_payload';
-	`, jobID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.Exec(`
-		  INSERT INTO system.job_info(job_id, info_key, value) SELECT job_id+4, info_key, NULL::BYTES FROM system.job_info WHERE job_id = $1 AND info_key = 'legacy_progress';
-		`, jobID); err != nil {
-		t.Fatal(err)
-	}
-
-	// Extract the last 3 rows from the query.
-	rows, err := sqlDB.Query(`
-  WITH a AS (SELECT job_id, description, fraction_completed, error FROM [SHOW JOBS] ORDER BY job_id DESC LIMIT 3)
-  SELECT job_id, ifnull(description, 'NULL'), ifnull(fraction_completed, -1)::string, ifnull(error,'NULL') FROM a ORDER BY job_id ASC`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-
-	var desc, frac, errStr string
-	var readID int64
-
-	// Valid row.
-	rowNum := 0
-	if !rows.Next() {
-		t.Fatalf("%d too few rows", rowNum)
-	}
-	if err := rows.Scan(&readID, &desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %d %q %q %v", rowNum, readID, desc, errStr, frac)
-	if desc == "NULL" || errStr != "" || frac[0] == '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
-
-	// Corrupted progress but valid payload.
-	if !rows.Next() {
-		t.Fatalf("%d: too few rows", rowNum)
-	}
-	if err := rows.Scan(&readID, &desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %d %q %q %v", rowNum, readID, desc, errStr, frac)
-	if desc == "NULL" || !strings.HasPrefix(errStr, "error decoding progress") || frac[0] != '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
-
-	// Valid payload and missing progress.
-	if !rows.Next() {
-		t.Fatalf("%d too few rows", rowNum)
-	}
-	if err := rows.Scan(&readID, &desc, &frac, &errStr); err != nil {
-		t.Fatalf("%d: %v", rowNum, err)
-	}
-	t.Logf("row %d: %d %q %q %v", rowNum, readID, desc, errStr, frac)
-	if desc == "NULL" || errStr != "" || frac[0] != '-' {
-		t.Fatalf("%d: invalid row", rowNum)
-	}
-	rowNum++
 }
 
 func TestShowJobWhenComplete(t *testing.T) {

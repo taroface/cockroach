@@ -13,6 +13,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -73,6 +74,10 @@ func (c *ConfigUri) AsClusterUri(ctx context.Context, db isql.DB) (ClusterUri, e
 	return ParseClusterUri(ec.ConnectionProto().UnredactedURI())
 }
 
+func (c *ConfigUri) IsExternalOrTestScheme() bool {
+	return c.uri.Scheme == "external" || c.uri.Scheme == "randomgen" && buildutil.CrdbTestBuild
+}
+
 // ClusterUri is a connection uri for a crdb cluster.
 type ClusterUri struct {
 	uri url.URL
@@ -88,6 +93,12 @@ func ParseClusterUri(uri string) (ClusterUri, error) {
 	}
 	if !allowedConfigUriSchemes[url.Scheme] {
 		return ClusterUri{}, errors.Newf("stream replication from scheme %q is unsupported", url.Scheme)
+	}
+	if url.Query().Has(RoutingModeKey) {
+		mode := url.Query().Get(RoutingModeKey)
+		if mode != string(RoutingModeNode) && mode != string(RoutingModeGateway) {
+			return ClusterUri{}, errors.Newf("unknown crdb_route value %q", mode)
+		}
 	}
 	return ClusterUri{uri: *url}, nil
 }
@@ -105,14 +116,21 @@ func MakeTestClusterUri(url url.URL) ClusterUri {
 	return ClusterUri{uri: url}
 }
 
-func (sa *ClusterUri) ResolveNode(hostname util.UnresolvedAddr) (ClusterUri, error) {
-	host, port, err := net.SplitHostPort(hostname.AddressField)
+// MakeClusterUriForNode creates a new ClusterUri with the node address set to the given
+// address. MakeClusterUriForNode will return an error if the uri has routing mode
+// gateway.
+func MakeClusterUriForNode(uri ClusterUri, nodeAddress util.UnresolvedAddr) (ClusterUri, error) {
+	if uri.RoutingMode() == RoutingModeGateway {
+		return ClusterUri{}, errors.Newf("cannot set node address on gateway uri %s", uri.Redacted())
+	}
+
+	host, port, err := net.SplitHostPort(nodeAddress.AddressField)
 	if err != nil {
 		return ClusterUri{}, err
 	}
-	copy := sa.uri
-	copy.Host = net.JoinHostPort(host, port)
-	return ClusterUri{uri: copy}, nil
+	copy := uri
+	copy.uri.Host = net.JoinHostPort(host, port)
+	return copy, nil
 }
 
 func (sa *ClusterUri) Serialize() string {
@@ -136,4 +154,33 @@ func redactUrl(u url.URL) string {
 	}
 	u.RawQuery = "redacted"
 	return u.String()
+}
+
+const RoutingModeKey = "crdb_route"
+
+type RoutingMode string
+
+const (
+	// routinModeNode is the default routing mode for LDR and PCR. The
+	// configuration uri is used to connect to the cluster and build a dist sql
+	// plan for the stream producers. The processors in the destination client
+	// then connect directly to the nodes described by the source cluster's plan.
+	RoutingModeNode RoutingMode = "node"
+	// routingModeGateway is a routing mode that replaces the default node
+	// routing mode. Processors in the source cluster will connect to the
+	// configured uri instead of the per-node uris returned by the source
+	// clusters plan. This allows for LDR and PCR to be used in situations where
+	// the source cluster nodes are not directly routable from the destination
+	// nodes.
+	RoutingModeGateway RoutingMode = "gateway"
+)
+
+// RoutingMode returns the routing mode specified in the uri. If no routing
+// mode is specified, the default routing mode is returned. The routing mode is
+// validated by the ClusterUri constructor.
+func (c *ClusterUri) RoutingMode() RoutingMode {
+	if key := c.uri.Query().Get(RoutingModeKey); key != "" {
+		return RoutingMode(key)
+	}
+	return RoutingModeNode
 }

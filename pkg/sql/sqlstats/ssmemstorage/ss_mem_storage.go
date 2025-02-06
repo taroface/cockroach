@@ -80,12 +80,11 @@ type Container struct {
 		stmts map[stmtKey]*stmtStats
 		txns  map[appstatspb.TransactionFingerprintID]*txnStats
 
-		// sampledPlanMetadataCache records when was the last time the plan was
-		// sampled. This data structure uses a subset of stmtKey as the key into
-		// in-memory dictionary in order to allow lookup for whether a plan has been
-		// sampled for a statement without needing to know the statement's
-		// transaction fingerprintID.
-		sampledPlanMetadataCache map[sampledPlanKey]time.Time
+		// sampledStatementCache records if the statement has been sampled via
+		// tracing. sampledPlanKey is used as the key to the map as it does not
+		// use transactionFingerprintID which is not available at the time of
+		// sampling decision.
+		sampledStatementCache map[sampledPlanKey]struct{}
 	}
 
 	txnCounts transactionCounts
@@ -94,8 +93,6 @@ type Container struct {
 	knobs     *sqlstats.TestingKnobs
 	anomalies *insights.AnomalyDetector
 }
-
-var _ sqlstats.ApplicationStats = &Container{}
 
 // New returns a new instance of Container.
 func New(
@@ -121,13 +118,11 @@ func New(
 
 	s.mu.stmts = make(map[stmtKey]*stmtStats)
 	s.mu.txns = make(map[appstatspb.TransactionFingerprintID]*txnStats)
-	s.mu.sampledPlanMetadataCache = make(map[sampledPlanKey]time.Time)
+	s.mu.sampledStatementCache = make(map[sampledPlanKey]struct{})
 
 	return s
 }
 
-// IterateAggregatedTransactionStats implements sqlstats.ApplicationStats
-// interface.
 func (s *Container) IterateAggregatedTransactionStats(
 	_ context.Context, _ sqlstats.IteratorOptions, visitor sqlstats.AggregatedTransactionVisitor,
 ) error {
@@ -155,7 +150,6 @@ func (s *Container) TxnStatsIterator(options sqlstats.IteratorOptions) TxnStatsI
 	return NewTxnStatsIterator(s, options)
 }
 
-// IterateStatementStats implements sqlstats.Provider interface.
 func (s *Container) IterateStatementStats(
 	ctx context.Context, options sqlstats.IteratorOptions, visitor sqlstats.StatementVisitor,
 ) error {
@@ -170,7 +164,6 @@ func (s *Container) IterateStatementStats(
 	return nil
 }
 
-// IterateTransactionStats implements sqlstats.Provider interface.
 func (s *Container) IterateTransactionStats(
 	ctx context.Context, options sqlstats.IteratorOptions, visitor sqlstats.TransactionVisitor,
 ) error {
@@ -309,9 +302,7 @@ func NewTempContainerFromExistingTxnStats(
 	return container, nil /* remaining */, nil /* err */
 }
 
-// NewApplicationStatsWithInheritedOptions implements the
-// sqlstats.ApplicationStats interface.
-func (s *Container) NewApplicationStatsWithInheritedOptions() sqlstats.ApplicationStats {
+func (s *Container) NewApplicationStatsWithInheritedOptions() *Container {
 	return New(
 		s.st,
 		// There is no need to constraint txn fingerprint limit since in temporary
@@ -393,10 +384,7 @@ func (s *stmtStats) sizeUnsafeLocked() int64 {
 	return stmtStatsShallowSize + databaseNameSize + dataSize
 }
 
-func (s *stmtStats) recordExecStats(stats execstats.QueryLevelStats) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *stmtStats) recordExecStatsLocked(stats execstats.QueryLevelStats) {
 	s.mu.data.ExecStats.Count++
 	count := s.mu.data.ExecStats.Count
 	s.mu.data.ExecStats.NetworkBytes.Record(count, float64(stats.NetworkBytesSent))
@@ -509,7 +497,7 @@ func (s *Container) getStatsForStmtWithKeyLocked(
 		stats = &stmtStats{}
 		stats.ID = stmtFingerprintID
 		s.mu.stmts[key] = stats
-		s.mu.sampledPlanMetadataCache[key.sampledPlanKey] = s.getTimeNow()
+		s.mu.sampledStatementCache[key.sampledPlanKey] = struct{}{}
 
 		return stats, true /* created */, false /* throttled */
 	}
@@ -660,7 +648,7 @@ func (s *Container) clearLocked(ctx context.Context) {
 	// large for the likely future workload.
 	s.mu.stmts = make(map[stmtKey]*stmtStats, len(s.mu.stmts)/2)
 	s.mu.txns = make(map[appstatspb.TransactionFingerprintID]*txnStats, len(s.mu.txns)/2)
-	s.mu.sampledPlanMetadataCache = make(map[sampledPlanKey]time.Time, len(s.mu.sampledPlanMetadataCache)/2)
+	s.mu.sampledStatementCache = make(map[sampledPlanKey]struct{}, len(s.mu.sampledStatementCache)/2)
 	if s.knobs != nil && s.knobs.OnAfterClear != nil {
 		s.knobs.OnAfterClear()
 	}
@@ -684,10 +672,9 @@ func (s *Container) freeLocked(ctx context.Context) {
 	s.mu.acc.Clear(ctx)
 }
 
-// MergeApplicationStatementStats implements the sqlstats.ApplicationStats interface.
 func (s *Container) MergeApplicationStatementStats(
 	ctx context.Context,
-	other sqlstats.ApplicationStats,
+	other *Container,
 	transactionFingerprintID appstatspb.TransactionFingerprintID,
 ) (discardedStats uint64) {
 	if err := other.IterateStatementStats(
@@ -716,10 +703,6 @@ func (s *Container) MergeApplicationStatementStats(
 			defer stmtStats.mu.Unlock()
 
 			stmtStats.mergeStatsLocked(statistics)
-			planLastSampled, _ := s.getLogicalPlanLastSampled(key.sampledPlanKey)
-			if planLastSampled.Before(stmtStats.mu.data.SensitiveInfo.MostRecentPlanTimestamp) {
-				s.setLogicalPlanLastSampled(key.sampledPlanKey, stmtStats.mu.data.SensitiveInfo.MostRecentPlanTimestamp)
-			}
 
 			return nil
 		},
@@ -911,33 +894,6 @@ func (s *transactionCounts) recordTransactionCounts(
 	if implicit {
 		s.mu.ImplicitCount++
 	}
-}
-
-func (s *Container) getLogicalPlanLastSampled(
-	key sampledPlanKey,
-) (lastSampled time.Time, found bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	lastSampled, found = s.mu.sampledPlanMetadataCache[key]
-	return lastSampled, found
-}
-
-func (s *Container) setLogicalPlanLastSampled(key sampledPlanKey, time time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mu.sampledPlanMetadataCache[key] = time
-}
-
-// shouldSaveLogicalPlanDescription returns whether we should save the sample
-// logical plan based on the time it was last sampled. We use
-// `logicalPlanCollectionPeriod` to assess how frequently to sample logical plans.
-func (s *Container) shouldSaveLogicalPlanDescription(lastSampled time.Time) bool {
-	if !sqlstats.SampleLogicalPlans.Get(&s.st.SV) {
-		return false
-	}
-	now := s.getTimeNow()
-	period := sqlstats.LogicalPlanCollectionPeriod.Get(&s.st.SV)
-	return now.Sub(lastSampled) >= period
 }
 
 type transactionCounts struct {

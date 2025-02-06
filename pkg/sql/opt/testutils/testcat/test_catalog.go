@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -47,12 +48,20 @@ const (
 
 // Catalog implements the cat.Catalog interface for testing purposes.
 type Catalog struct {
-	testSchema Schema
-	counter    int
-	enumTypes  map[string]*types.T
+	testSchema       Schema
+	counter          int
+	dependencyDigest int64
+	enumTypes        map[string]*types.T
 
 	udfs           map[string]*tree.ResolvedFunctionDefinition
 	revokedUDFOids intsets.Fast
+
+	users       map[username.SQLUsername]roleMembership
+	currentUser username.SQLUsername
+}
+
+type roleMembership struct {
+	isMemberOfAdminRole bool
 }
 
 type dataSource interface {
@@ -64,6 +73,9 @@ var _ cat.Catalog = &Catalog{}
 
 // New creates a new empty instance of the test catalog.
 func New() *Catalog {
+	users := make(map[username.SQLUsername]roleMembership)
+	users[username.RootUserName()] = roleMembership{isMemberOfAdminRole: true}
+
 	return &Catalog{
 		testSchema: Schema{
 			SchemaID: 1,
@@ -75,6 +87,8 @@ func New() *Catalog {
 			},
 			dataSources: make(map[string]dataSource),
 		},
+		users:       users,
+		currentUser: username.RootUserName(),
 	}
 }
 
@@ -305,7 +319,16 @@ func (tc *Catalog) CheckExecutionPrivilege(
 
 // HasAdminRole is part of the cat.Catalog interface.
 func (tc *Catalog) HasAdminRole(ctx context.Context) (bool, error) {
-	return true, nil
+	return tc.UserHasAdminRole(ctx, tc.currentUser)
+}
+
+// UserHasAdminRole is part of the cat.Catalog interface.
+func (tc *Catalog) UserHasAdminRole(ctx context.Context, user username.SQLUsername) (bool, error) {
+	roleMembership, found := tc.users[user]
+	if !found {
+		return false, errors.AssertionFailedf("user %q not found", user)
+	}
+	return roleMembership.isMemberOfAdminRole, nil
 }
 
 // HasRoleOption is part of the cat.Catalog interface.
@@ -332,7 +355,7 @@ func (tc *Catalog) Optimizer() interface{} {
 
 // GetCurrentUser is part of the cat.Catalog interface.
 func (tc *Catalog) GetCurrentUser() username.SQLUsername {
-	return username.EmptyRoleName()
+	return tc.currentUser
 }
 
 // GetRoutineOwner is part of the cat.Catalog interface.
@@ -453,6 +476,21 @@ func (tc *Catalog) AddSequence(seq *Sequence) {
 	tc.testSchema.dataSources[fq] = seq
 }
 
+// GetDependencyDigest always assume that the generations are changing
+// on us.
+func (tc *Catalog) GetDependencyDigest() cat.DependencyDigest {
+	tc.dependencyDigest++
+	return cat.DependencyDigest{
+		LeaseGeneration: tc.dependencyDigest,
+		CurrentUser:     tc.currentUser,
+	}
+}
+
+// LeaseByStableID does not do anything since no leasing is used here.
+func (tc *Catalog) LeaseByStableID(_ context.Context, _ cat.StableID) error {
+	return nil
+}
+
 // ExecuteMultipleDDL parses the given semicolon-separated DDL SQL statements
 // and applies each of them to the test catalog.
 func (tc *Catalog) ExecuteMultipleDDL(sql string) error {
@@ -570,6 +608,22 @@ func (tc *Catalog) executeDDLStmtWithIndexVersion(
 
 	case *tree.DropTrigger:
 		tc.DropTrigger(stmt)
+		return "", nil
+
+	case *tree.CreatePolicy:
+		tc.CreatePolicy(stmt)
+		return "", nil
+
+	case *tree.DropPolicy:
+		tc.DropPolicy(stmt)
+		return "", nil
+
+	case *tree.SetVar:
+		tc.SetVar(stmt)
+		return "", nil
+
+	case *tree.CreateRole:
+		tc.CreateRole(stmt)
 		return "", nil
 
 	default:
@@ -789,6 +843,9 @@ type Table struct {
 	implicitRBRIndexElem *tree.IndexElem
 
 	homeRegion string
+
+	rlsEnabled bool
+	policies   cat.Policies
 }
 
 var _ cat.Table = &Table{}
@@ -1064,6 +1121,49 @@ func (tt *Table) Trigger(i int) cat.Trigger {
 	return &tt.Triggers[i]
 }
 
+// IsRowLevelSecurityEnabled is part of the cat.Table interface.
+func (tt *Table) IsRowLevelSecurityEnabled() bool { return tt.rlsEnabled }
+
+// PolicyCount is part of the cat.Table interface
+func (tt *Table) PolicyCount(polType tree.PolicyType) int {
+	switch polType {
+	case tree.PolicyTypeRestrictive:
+		return len(tt.policies.Restrictive)
+	default:
+		return len(tt.policies.Permissive)
+	}
+}
+
+// Policy is part of the cat.Table interface
+func (tt *Table) Policy(policyType tree.PolicyType, index int) cat.Policy {
+	var policies []cat.Policy
+	switch policyType {
+	case tree.PolicyTypeRestrictive:
+		policies = tt.policies.Restrictive
+	default:
+		policies = tt.policies.Permissive
+	}
+	if index >= len(policies) {
+		panic(errors.AssertionFailedf("policy of type %v at index %d not found", policyType, index))
+	}
+	return policies[index]
+}
+
+// findPolicyByName will lookup the policy by its name. It returns it's policy
+// type and index within that policy type slice so that callers can do removal
+// if needed.
+func (tt *Table) findPolicyByName(policyName tree.Name) (*cat.Policy, tree.PolicyType, int) {
+	for _, pt := range []tree.PolicyType{tree.PolicyTypePermissive, tree.PolicyTypeRestrictive} {
+		for i := range tt.PolicyCount(pt) {
+			p := tt.Policy(pt, i)
+			if p.Name == policyName {
+				return &p, pt, i
+			}
+		}
+	}
+	return nil, tree.PolicyTypePermissive, -1
+}
+
 // Index implements the cat.Index interface for testing purposes.
 type Index struct {
 	IdxName string
@@ -1084,11 +1184,8 @@ type Index struct {
 	// Unique is true if this index is declared as UNIQUE in the schema.
 	Unique bool
 
-	// Inverted is true when this index is an inverted index.
-	Inverted bool
-
-	// Vector is true when this index is a vector index.
-	Vector bool
+	// Typ is the type of the index: forward, inverted, vector, etc.
+	Typ idxtype.T
 
 	// Invisibility specifies the invisibility of an index and can be any float64
 	// between [0.0, 1.0]. An index with invisibility 0.0 means that the index is
@@ -1160,14 +1257,9 @@ func (ti *Index) IsUnique() bool {
 	return ti.Unique
 }
 
-// IsInverted is part of the cat.Index interface.
-func (ti *Index) IsInverted() bool {
-	return ti.Inverted
-}
-
-// IsVector is part of the cat.Index interface.
-func (ti *Index) IsVector() bool {
-	return ti.Vector
+// Type is part of the cat.Index interface.
+func (ti *Index) Type() idxtype.T {
+	return ti.Typ
 }
 
 // GetInvisibility is part of the cat.Index interface.
@@ -1197,13 +1289,14 @@ func (ti *Index) LaxKeyColumnCount() int {
 
 // PrefixColumnCount is part of the cat.Index interface.
 func (ti *Index) PrefixColumnCount() int {
-	if ti.IsInverted() {
+	switch ti.Type() {
+	case idxtype.INVERTED:
 		return ti.invertedOrd
-	}
-	if ti.IsVector() {
+	case idxtype.VECTOR:
 		return ti.vectorOrd
+	default:
+		panic("only supported for inverted and vector indexes")
 	}
-	panic("only supported for inverted and vector indexes")
 }
 
 // Column is part of the cat.Index interface.
@@ -1213,7 +1306,7 @@ func (ti *Index) Column(i int) cat.IndexColumn {
 
 // InvertedColumn is part of the cat.Index interface.
 func (ti *Index) InvertedColumn() cat.IndexColumn {
-	if !ti.IsInverted() {
+	if ti.Type() != idxtype.INVERTED {
 		panic("non-inverted indexes do not have inverted columns")
 	}
 	return ti.Column(ti.invertedOrd)
@@ -1221,7 +1314,7 @@ func (ti *Index) InvertedColumn() cat.IndexColumn {
 
 // VectorColumn is part of the cat.Index interface.
 func (ti *Index) VectorColumn() cat.IndexColumn {
-	if !ti.IsVector() {
+	if ti.Type() != idxtype.VECTOR {
 		panic("non-vector indexes do not have indexed vector columns")
 	}
 	return ti.Column(ti.vectorOrd)

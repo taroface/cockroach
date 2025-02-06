@@ -96,8 +96,6 @@ func makeTestBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 	baseCfg := MakeBaseConfig(st, tr, base.DefaultTestStoreSpec)
 	// Test servers start in secure mode by default.
 	baseCfg.Insecure = false
-	// Configure test storage engine.
-	baseCfg.StorageEngine = storage.DefaultStorageEngine
 	// Load test certs. In addition, the tests requiring certs
 	// need to call securityassets.SetLoader(securitytest.EmbeddedAssets)
 	// in their init to mock out the file system calls for calls to AssetFS,
@@ -145,7 +143,6 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 		st = cluster.MakeClusterSettings()
 	}
 
-	st.ExternalIODir = params.ExternalIODir
 	tr := params.Tracer
 	if params.Tracer == nil {
 		tr = tracing.NewTracerWithOpt(context.TODO(), tracing.WithClusterSettings(&st.SV), tracing.WithTracingMode(params.TracingDefault))
@@ -166,6 +163,7 @@ func makeTestConfigFromParams(params base.TestServerArgs) Config {
 	cfg.Locality = params.Locality
 	cfg.StartDiagnosticsReporting = params.StartDiagnosticsReporting
 	cfg.DisableSQLServer = params.DisableSQLServer
+	cfg.ExternalIODir = params.ExternalIODir
 	if params.TraceDir != "" {
 		if err := initTraceDir(params.TraceDir); err == nil {
 			cfg.InflightTraceDirName = params.TraceDir
@@ -566,6 +564,11 @@ func (ts *testServer) TestingKnobs() *base.TestingKnobs {
 	return nil
 }
 
+// ExternalIODir is part of the serverutils.ApplicationLayerInterface.
+func (ts *testServer) ExternalIODir() string {
+	return ts.cfg.ExternalIODir
+}
+
 // SQLServerInternal is part of the serverutils.ApplicationLayerInterface.
 func (ts *testServer) SQLServerInternal() interface{} {
 	return ts.sqlServer
@@ -603,6 +606,7 @@ func (ts *testServer) startDefaultTestTenant(
 	}
 
 	params := base.TestTenantArgs{
+		TenantName: ts.params.DefaultTenantName,
 		// Currently, all the servers leverage the same tenant ID. We may
 		// want to change this down the road, for more elaborate testing.
 		TenantID:                  serverutils.TestTenantID(),
@@ -618,35 +622,36 @@ func (ts *testServer) startDefaultTestTenant(
 		StartDiagnosticsReporting: ts.params.StartDiagnosticsReporting,
 		Settings:                  tenantSettings,
 	}
-
-	// Since we're creating a tenant, it doesn't make sense to pass through the
-	// Server testing knobs, since the bulk of them only apply to the system
-	// tenant. Any remaining knobs which are required by the tenant should be
-	// passed through here.
-	params.TestingKnobs.Server = &TestingKnobs{}
-
-	if ts.params.Knobs.Server != nil {
-		params.TestingKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs = ts.params.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
-		params.TestingKnobs.LicenseTestingKnobs = ts.params.Knobs.LicenseTestingKnobs
-	}
+	ts.setupTenantTestingKnobs(&params.TestingKnobs)
 	return ts.StartTenant(ctx, params)
 }
 
 func (ts *testServer) getSharedProcessDefaultTenantArgs() base.TestSharedProcessTenantArgs {
 	args := base.TestSharedProcessTenantArgs{
-		TenantName:  "test-tenant",
+		TenantName:  ts.params.DefaultTenantName,
 		TenantID:    serverutils.TestTenantID(),
 		Knobs:       ts.params.Knobs,
 		UseDatabase: ts.params.UseDatabase,
 		Settings:    ts.params.Settings,
 	}
-	// See comment above on separate process tenant regarding the testing knobs.
-	args.Knobs.Server = &TestingKnobs{}
-	if ts.params.Knobs.Server != nil {
-		args.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs = ts.params.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
-		args.Knobs.LicenseTestingKnobs = ts.params.Knobs.LicenseTestingKnobs
-	}
+	ts.setupTenantTestingKnobs(&args.Knobs)
 	return args
+}
+
+func (ts *testServer) setupTenantTestingKnobs(tenantKnobs *base.TestingKnobs) {
+	// Since we're creating a tenant, it doesn't make sense to pass through the
+	// Server testing k, since the bulk of them only apply to the system
+	// tenant. Any remaining k which are required by the tenant should be
+	// passed through here.
+	tenantKnobs.Server = &TestingKnobs{}
+	if ts.params.Knobs.Server != nil {
+		tenantKnobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs =
+			ts.params.Knobs.Server.(*TestingKnobs).DiagnosticsTestingKnobs
+		tenantKnobs.Server.(*TestingKnobs).ContextTestingKnobs = rpc.ContextTestingKnobs{
+			InjectedLatencyOracle:  ts.params.Knobs.Server.(*TestingKnobs).ContextTestingKnobs.InjectedLatencyOracle,
+			InjectedLatencyEnabled: ts.params.Knobs.Server.(*TestingKnobs).ContextTestingKnobs.InjectedLatencyEnabled,
+		}
+	}
 }
 
 func (ts *testServer) startSharedProcessDefaultTestTenant(
@@ -789,6 +794,12 @@ func (ts *testServer) PreStart(ctx context.Context) error {
 	func(args base.TestSharedProcessTenantArgs) {
 		ts.topLevelServer.serverController.mu.Lock()
 		defer ts.topLevelServer.serverController.mu.Unlock()
+		// Note: Since we are fetching default tenant args, only the default tenant
+		// (i.e., demoapp, test-tenant) is present here. If a test starts another
+		// secondary tenant with different arguments (such as testing knobs), those
+		// arguments won't be present in the testArgs map. To prevent the race
+		// condition mentioned earlier, we should disable the server controller
+		// tenant watcher and start those tenants explicitly on every node.
 		ts.topLevelServer.serverController.mu.testArgs[args.TenantName] = args
 	}(ts.getSharedProcessDefaultTenantArgs())
 	return ts.topLevelServer.PreStart(ctx)
@@ -936,6 +947,11 @@ func (t *testTenant) HTTPAddr() string {
 // RPCAddr is part of the serverutils.ApplicationLayerInterface.
 func (t *testTenant) RPCAddr() string {
 	return t.Cfg.Addr
+}
+
+// ExternalIODir is part of the serverutils.ApplicationLayerInterface.
+func (t *testTenant) ExternalIODir() string {
+	return t.Cfg.ExternalIODir
 }
 
 // SQLConn is part of the serverutils.ApplicationLayerInterface.
@@ -1546,15 +1562,15 @@ func (ts *testServer) StartTenant(
 
 	ie := ts.InternalExecutor().(*sql.InternalExecutor)
 	if !params.DisableCreateTenant {
-		rowCount, err := ie.Exec(
+		row, err := ie.QueryRow(
 			ctx, "testserver-check-tenant-active", nil,
-			"SELECT 1 FROM system.tenants WHERE id=$1 AND active=true",
+			"SELECT name FROM system.tenants WHERE id=$1 AND active=true",
 			params.TenantID.ToUint64(),
 		)
 		if err != nil {
 			return nil, err
 		}
-		if rowCount == 0 {
+		if row == nil {
 			// Tenant doesn't exist. Create it.
 			if _, err := ie.Exec(
 				ctx, "testserver-create-tenant", nil /* txn */, "SELECT crdb_internal.create_tenant($1, $2)",
@@ -1562,7 +1578,7 @@ func (ts *testServer) StartTenant(
 			); err != nil {
 				return nil, err
 			}
-		} else if params.TenantName != "" {
+		} else if params.TenantName != "" && params.TenantName != roachpb.TenantName(tree.MustBeDString(row[0])) {
 			_, err := ie.Exec(ctx, "rename-test-tenant", nil,
 				`ALTER TENANT [$1] RENAME TO $2`,
 				params.TenantID.ToUint64(), params.TenantName)
@@ -1634,7 +1650,6 @@ func (ts *testServer) StartTenant(
 		st = cluster.MakeTestingClusterSettings()
 	}
 
-	st.ExternalIODir = params.ExternalIODir
 	sqlCfg := makeTestSQLConfig(st, params.TenantID)
 	sqlCfg.TenantLoopbackAddr = ts.AdvRPCAddr()
 	if params.MemoryPoolSize != 0 {
@@ -1692,6 +1707,7 @@ func (ts *testServer) StartTenant(
 	baseCfg.CPUProfileDirName = ts.Cfg.BaseConfig.CPUProfileDirName
 	baseCfg.GoroutineDumpDirName = ts.Cfg.BaseConfig.GoroutineDumpDirName
 	baseCfg.ExternalIODirConfig = params.ExternalIODirConfig
+	baseCfg.ExternalIODir = params.ExternalIODir
 
 	// Grant the tenant the default capabilities.
 	if err := ts.grantDefaultTenantCapabilities(ctx, params.TenantID, params.SkipTenantCheck); err != nil {

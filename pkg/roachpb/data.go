@@ -991,6 +991,18 @@ func (v Value) PrettyPrint() (ret string) {
 		var d duration.Duration
 		d, err = v.GetDuration()
 		buf.WriteString(d.StringNanos())
+	case ValueType_TIMETZ:
+		var tz timetz.TimeTZ
+		tz, err = v.GetTimeTZ()
+		buf.WriteString(tz.String())
+	case ValueType_GEO:
+		var g geopb.SpatialObject
+		g, err = v.GetGeo()
+		buf.WriteString(g.String())
+	case ValueType_BOX2D:
+		var g geopb.BoundingBox
+		g, err = v.GetBox2D()
+		buf.WriteString(g.String())
 	default:
 		err = errors.Errorf("unknown tag: %s", t)
 	}
@@ -1976,7 +1988,7 @@ func (l Lease) OwnedBy(storeID StoreID) bool {
 // LeaseType describes the type of lease.
 //
 //go:generate stringer -type=LeaseType
-type LeaseType int
+type LeaseType int32
 
 const (
 	// LeaseNone specifies no lease, to be used as a default value.

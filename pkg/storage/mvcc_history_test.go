@@ -43,6 +43,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
@@ -262,7 +263,7 @@ func TestMVCCHistories(t *testing.T) {
 		// SST iterator in order to accurately represent the raw SST data.
 		reportSSTEntries := func(buf *redact.StringBuilder, name string, sst []byte) error {
 			r, err := sstable.NewMemReader(sst, sstable.ReaderOptions{
-				Comparer:   storage.EngineComparer,
+				Comparer:   &storage.EngineComparer,
 				KeySchemas: sstable.MakeKeySchemas(storage.KeySchemas...),
 			})
 			if err != nil {
@@ -297,7 +298,7 @@ func TestMVCCHistories(t *testing.T) {
 			}
 
 			// Dump rangedels.
-			if rdIter, err := r.NewRawRangeDelIter(context.Background(), sstable.NoFragmentTransforms); err != nil {
+			if rdIter, err := r.NewRawRangeDelIter(context.Background(), block.NoFragmentTransforms, block.NoReadEnv); err != nil {
 				return err
 			} else if rdIter != nil {
 				defer rdIter.Close()
@@ -322,7 +323,7 @@ func TestMVCCHistories(t *testing.T) {
 			}
 
 			// Dump range keys.
-			if rkIter, err := r.NewRawRangeKeyIter(context.Background(), sstable.NoFragmentTransforms); err != nil {
+			if rkIter, err := r.NewRawRangeKeyIter(context.Background(), block.NoFragmentTransforms, block.NoReadEnv); err != nil {
 				return err
 			} else if rkIter != nil {
 				defer rkIter.Close()
@@ -1182,7 +1183,13 @@ func cmdAcquireLock(e *evalCtx) error {
 		str := e.getStrength()
 		maxLockConflicts := e.getMaxLockConflicts()
 		targetLockConflictBytes := e.getTargetLockConflictBytes()
-		return storage.MVCCAcquireLock(e.ctx, rw, txn, str, key, e.ms, maxLockConflicts, targetLockConflictBytes)
+		var txnMeta *enginepb.TxnMeta
+		var ignoredSeq []enginepb.IgnoredSeqNumRange
+		if txn != nil {
+			txnMeta = &txn.TxnMeta
+			ignoredSeq = txn.IgnoredSeqNums
+		}
+		return storage.MVCCAcquireLock(e.ctx, rw, txnMeta, ignoredSeq, str, key, e.ms, maxLockConflicts, targetLockConflictBytes)
 	})
 }
 

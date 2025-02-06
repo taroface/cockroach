@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -468,6 +469,12 @@ func (w *walkCtx) walkRelation(tbl catalog.TableDescriptor) {
 	if tbl.IsSchemaLocked() {
 		w.ev(scpb.Status_PUBLIC, &scpb.TableSchemaLocked{TableID: tbl.GetID()})
 	}
+	if tbl.IsRowLevelSecurityEnabled() {
+		w.ev(scpb.Status_PUBLIC, &scpb.RowLevelSecurityEnabled{TableID: tbl.GetID()})
+	}
+	if tbl.IsRowLevelSecurityForced() {
+		w.ev(scpb.Status_PUBLIC, &scpb.RowLevelSecurityForced{TableID: tbl.GetID()})
+	}
 	if tbl.TableDesc().LDRJobIDs != nil {
 		w.ev(scpb.Status_PUBLIC, &scpb.LDRJobIDs{
 			TableID: tbl.GetID(),
@@ -632,7 +639,8 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 			TableID:             tbl.GetID(),
 			IndexID:             idx.GetID(),
 			IsUnique:            idx.IsUnique(),
-			IsInverted:          idx.GetType() == descpb.IndexDescriptor_INVERTED,
+			IsInverted:          idx.GetType() == idxtype.INVERTED,
+			Type:                idx.GetType(),
 			IsCreatedExplicitly: idx.IsCreatedExplicitly(),
 			ConstraintID:        idx.GetConstraintID(),
 			IsNotVisible:        idx.GetInvisibility() != 0.0,
@@ -643,7 +651,7 @@ func (w *walkCtx) walkIndex(tbl catalog.TableDescriptor, idx catalog.Index) {
 		}
 		for i, c := range cpy.KeyColumnIDs {
 			invertedKind := catpb.InvertedIndexColumnKind_DEFAULT
-			if index.IsInverted && c == idx.InvertedColumnID() {
+			if index.Type == idxtype.INVERTED && c == idx.InvertedColumnID() {
 				invertedKind = idx.InvertedColumnKind()
 			}
 			w.ev(scpb.Status_PUBLIC, &scpb.IndexColumn{
@@ -878,12 +886,54 @@ func (w *walkCtx) walkPolicy(tbl catalog.TableDescriptor, p *descpb.PolicyDescri
 	w.ev(scpb.Status_PUBLIC, &scpb.Policy{
 		TableID:  tbl.GetID(),
 		PolicyID: p.ID,
+		Type:     p.Type,
+		Command:  p.Command,
 	})
 	w.ev(scpb.Status_PUBLIC, &scpb.PolicyName{
 		TableID:  tbl.GetID(),
 		PolicyID: p.ID,
 		Name:     p.Name,
 	})
+	for _, role := range p.RoleNames {
+		w.ev(scpb.Status_PUBLIC, &scpb.PolicyRole{
+			TableID:  tbl.GetID(),
+			PolicyID: p.ID,
+			RoleName: role,
+		})
+	}
+	if p.UsingExpr != "" {
+		expr, err := w.newExpression(p.UsingExpr)
+		if err != nil {
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "USING expression for policy %q in table %q (%d)",
+				p.Name, tbl.GetName(), tbl.GetID()))
+		}
+		w.ev(scpb.Status_PUBLIC, &scpb.PolicyUsingExpr{
+			TableID:    tbl.GetID(),
+			PolicyID:   p.ID,
+			Expression: *expr,
+		})
+	}
+	if p.WithCheckExpr != "" {
+		expr, err := w.newExpression(p.WithCheckExpr)
+		if err != nil {
+			panic(errors.NewAssertionErrorWithWrappedErrf(err, "WITH CHECK expression for policy %q in table %q (%d)",
+				p.Name, tbl.GetName(), tbl.GetID()))
+		}
+		w.ev(scpb.Status_PUBLIC, &scpb.PolicyWithCheckExpr{
+			TableID:    tbl.GetID(),
+			PolicyID:   p.ID,
+			Expression: *expr,
+		})
+	}
+	if p.UsingExpr != "" || p.WithCheckExpr != "" {
+		w.ev(scpb.Status_PUBLIC, &scpb.PolicyDeps{
+			TableID:         tbl.GetID(),
+			PolicyID:        p.ID,
+			UsesTypeIDs:     p.DependsOnTypes,
+			UsesRelationIDs: p.DependsOnRelations,
+			UsesFunctionIDs: p.DependsOnFunctions,
+		})
+	}
 }
 
 func (w *walkCtx) walkForeignKeyConstraint(

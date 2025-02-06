@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -946,7 +947,7 @@ var varGen = map[string]sessionVar{
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseMergedPartialStatistics), nil
 		},
-		GlobalDefault: globalFalse,
+		GlobalDefault: globalTrue,
 	},
 
 	// CockroachDB extension.
@@ -1582,7 +1583,7 @@ var varGen = map[string]sessionVar{
 
 	// CockroachDB extension.
 	`crdb_version`: makeReadOnlyVarWithFn(func() string {
-		return build.GetInfo().Short()
+		return build.GetInfo().Short().StripMarkers()
 	}),
 
 	// CockroachDB extension
@@ -3614,7 +3615,7 @@ var varGen = map[string]sessionVar{
 			return evalCtx.SessionData().PlanCacheMode.String(), nil
 		},
 		GlobalDefault: func(sv *settings.Values) string {
-			return sessiondatapb.PlanCacheModeAuto.String()
+			return planCacheClusterMode.String(sv)
 		},
 	},
 
@@ -3723,6 +3724,84 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().LegacyVarcharTyping), nil
 		},
 		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`catalog_digest_staleness_check_enabled`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`catalog_digest_staleness_check_enabled`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("catalog_digest_staleness_check_enabled", s)
+			if err != nil {
+				return err
+			}
+			m.SetCatalogDigestStalenessCheckEnabled(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().CatalogDigestStalenessCheckEnabled), nil
+		},
+		GlobalDefault: globalTrue,
+		Hidden:        true,
+	},
+
+	// CockroachDB extension.
+	`optimizer_prefer_bounded_cardinality`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_prefer_bounded_cardinality`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_prefer_bounded_cardinality", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerPreferBoundedCardinality(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerPreferBoundedCardinality), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	`optimizer_min_row_count`: {
+		GetStringVal: makeFloatGetStringValFn(`optimizer_min_row_count`),
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatFloatAsPostgresSetting(evalCtx.SessionData().OptimizerMinRowCount), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return "0"
+		},
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return err
+			}
+			// Note that we permit fractions above 1.0 to allow for giving
+			// head-of-the-line batch more memory that is available - this will
+			// put the budget in debt.
+			if f < 0 {
+				return pgerror.New(pgcode.InvalidParameterValue, "optimizer_min_row_count must be non-negative")
+			}
+			m.SetOptimizerMinRowCount(f)
+			return nil
+		},
+	},
+
+	// CockroachDB extension.
+	`kv_transaction_buffered_writes_enabled`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().BufferedWritesEnabled), nil
+		},
+		GetStringVal: makePostgresBoolGetStringValFn("kv_transaction_buffered_writes_enabled"),
+		Set: func(ctx context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar(`kv_transaction_buffered_writes_enabled`, s)
+			if err != nil {
+				return err
+			}
+			m.SetBufferedWritesEnabled(b)
+			return nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return formatBoolAsPostgresSetting(kvcoord.BufferedWritesEnabled.Get(sv))
+		},
 	},
 }
 

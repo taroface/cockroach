@@ -170,8 +170,11 @@ func (f *CoordinatorFrontier) InBackfill(r jobspb.ResolvedSpan) bool {
 }
 
 // MakeCheckpoint creates a checkpoint based on the current state of the frontier.
-func (f *CoordinatorFrontier) MakeCheckpoint(maxBytes int64) jobspb.ChangefeedProgress_Checkpoint {
-	return checkpoint.Make(f.Frontier(), f.Entries, maxBytes)
+func (f *CoordinatorFrontier) MakeCheckpoint(
+	maxBytes int64, metrics *checkpoint.Metrics,
+) jobspb. //lint:ignore SA1019 deprecated usage
+		ChangefeedProgress_Checkpoint {
+	return checkpoint.Make(f.Frontier(), f.Entries, maxBytes, metrics)
 }
 
 // spanFrontier is a type alias to make it possible to embed and forward calls
@@ -295,9 +298,9 @@ func (f *resolvedSpanFrontier) assertBoundaryNotEarlier(
 
 // HasLaggingSpans returns whether the frontier has lagging spans as defined
 // by whether the frontier trails the latest timestamp by at least
-// changefeedbase.FrontierHighwaterLagCheckpointThreshold.
+// changefeedbase.SpanCheckpointLagThreshold.
 func (f *resolvedSpanFrontier) HasLaggingSpans(sv *settings.Values) bool {
-	lagThresholdNanos := int64(changefeedbase.FrontierHighwaterLagCheckpointThreshold.Get(sv))
+	lagThresholdNanos := int64(changefeedbase.SpanCheckpointLagThreshold.Get(sv))
 	if lagThresholdNanos == 0 {
 		return false
 	}

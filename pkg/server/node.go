@@ -50,7 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/disk"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
@@ -77,6 +76,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -440,6 +440,7 @@ type Node struct {
 	}
 
 	// Event handler called in logStructuredEvent. Used in tests only.
+	// TODO(radu): this should be a testing knob.
 	onStructuredEvent func(ctx context.Context, event logpb.EventPayload)
 
 	// licenseEnforcer is used to enforce license policies on the cluster
@@ -790,7 +791,7 @@ func (n *Node) start(
 		// sequence ID generator stored in a system key.
 		n.additionalStoreInitCh = make(chan struct{})
 		if err := n.stopper.RunAsyncTask(workersCtx, "initialize-additional-stores", func(ctx context.Context) {
-			if err := n.initializeAdditionalStores(ctx, state.uninitializedEngines, n.stopper); err != nil {
+			if err := n.initializeAdditionalStores(ctx, state.uninitializedEngines); err != nil {
 				log.Fatalf(ctx, "while initializing additional stores: %v", err)
 			}
 			close(n.additionalStoreInitCh)
@@ -827,12 +828,6 @@ func (n *Node) start(
 		}
 	})
 
-	allEngines := append([]storage.Engine(nil), state.initializedEngines...)
-	allEngines = append(allEngines, state.uninitializedEngines...)
-	for _, e := range allEngines {
-		t := e.Type()
-		log.Infof(ctx, "started with engine type %v", &t)
-	}
 	log.Infof(ctx, "started with attributes %v", attrs.Attrs)
 
 	n.startPeriodicLivenessCompaction(n.stopper, livenessRangeCompactInterval)
@@ -895,6 +890,9 @@ func (n *Node) addStore(ctx context.Context, store *kvserver.Store) {
 	}
 	store.TODOEngine().RegisterDiskSlowCallback(func(info pebble.DiskSlowInfo) {
 		n.onStoreDiskSlow(n.AnnotateCtx(context.Background()), store.StoreID(), info)
+	})
+	store.TODOEngine().RegisterLowDiskSpaceCallback(func(info pebble.LowDiskSpaceInfo) {
+		n.onLowDiskSpace(n.AnnotateCtx(context.Background()), store.StoreID(), info)
 	})
 	n.stores.AddStore(store)
 	n.recorder.AddStore(store)
@@ -975,6 +973,20 @@ func (n *Node) onStoreDiskSlow(
 
 }
 
+func (n *Node) onLowDiskSpace(
+	ctx context.Context, storeID roachpb.StoreID, info pebble.LowDiskSpaceInfo,
+) {
+	ev := &eventpb.LowDiskSpace{
+		StoreID:          int32(storeID),
+		NodeID:           int32(n.Descriptor.NodeID),
+		PercentThreshold: int32(info.PercentThreshold),
+		AvailableBytes:   info.AvailBytes,
+		TotalBytes:       info.TotalBytes,
+	}
+	ev.CommonDetails().Timestamp = timeutil.Now().UnixNano()
+	n.logStructuredEvent(ctx, logpb.EventPayload(ev))
+}
+
 // validateStores iterates over all stores, verifying they agree on node ID.
 // The node's ident is initialized based on the agreed-upon node ID. Note that
 // cluster ID consistency is checked elsewhere in inspectEngines.
@@ -993,9 +1005,7 @@ func (n *Node) validateStores(ctx context.Context) error {
 // cluster and node ID have been established for this node. Store IDs are
 // allocated via a sequence id generator stored at a system key per node. The
 // new stores are added to n.stores.
-func (n *Node) initializeAdditionalStores(
-	ctx context.Context, engines []storage.Engine, stopper *stop.Stopper,
-) error {
+func (n *Node) initializeAdditionalStores(ctx context.Context, engines []storage.Engine) error {
 	if n.clusterID.Get() == uuid.Nil {
 		return errors.New("missing cluster ID during initialization of additional store")
 	}
@@ -1022,7 +1032,7 @@ func (n *Node) initializeAdditionalStores(
 			}
 
 			s := kvserver.NewStore(ctx, n.storeCfg, eng, &n.Descriptor)
-			if err := s.Start(ctx, stopper); err != nil {
+			if err := s.Start(ctx, n.stopper); err != nil {
 				return err
 			}
 
@@ -1716,7 +1726,7 @@ func (n *Node) batchInternal(
 	// To avoid log spam for now we only log the trace if the request was an
 	// ExportRequest.
 	if pErr != nil && ctx.Err() != nil && args.IsSingleExportRequest() {
-		if sp := tracing.SpanFromContext(ctx); sp != nil && !sp.IsNoop() {
+		if sp := tracing.SpanFromContext(ctx); sp != nil {
 			recording := sp.GetConfiguredRecording()
 			if recording.Len() != 0 {
 				log.Infof(ctx, "batch request %s failed with error: %v\ntrace:\n%s", args.String(),
@@ -1895,6 +1905,18 @@ func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchR
 
 // BatchStream implements the kvpb.InternalServer interface.
 func (n *Node) BatchStream(stream kvpb.Internal_BatchStreamServer) error {
+	return n.batchStreamImpl(stream, func(ba *kvpb.BatchRequest) error {
+		return stream.RecvMsg(ba)
+	})
+}
+
+func (n *Node) batchStreamImpl(
+	stream interface {
+		Context() context.Context
+		Send(response *kvpb.BatchResponse) error
+	},
+	recvMsg func(*kvpb.BatchRequest) error,
+) error {
 	ctx := stream.Context()
 	for {
 		argsAlloc := new(struct {
@@ -1904,10 +1926,8 @@ func (n *Node) BatchStream(stream kvpb.Internal_BatchStreamServer) error {
 		args := &argsAlloc.args
 		args.Requests = argsAlloc.reqs[:0]
 
-		err := stream.RecvMsg(args)
+		err := recvMsg(args)
 		if err != nil {
-			// From grpc.ServerStream.Recv:
-			// > It returns io.EOF when the client has performed a CloseSend.
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
@@ -1923,6 +1943,26 @@ func (n *Node) BatchStream(stream kvpb.Internal_BatchStreamServer) error {
 			return err
 		}
 	}
+}
+
+func (n *Node) AsDRPCBatchServer() kvpb.DRPCBatchServer {
+	return (*drpcNode)(n)
+}
+
+type drpcNode Node
+
+func (n *drpcNode) Batch(
+	ctx context.Context, request *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
+	return (*Node)(n).Batch(ctx, request)
+}
+
+func (n *drpcNode) BatchStream(stream kvpb.DRPCBatch_BatchStreamStream) error {
+	return (*Node)(n).batchStreamImpl(stream, func(ba *kvpb.BatchRequest) error {
+		return stream.(interface {
+			RecvMsg(request *kvpb.BatchRequest) error
+		}).RecvMsg(ba)
+	})
 }
 
 // spanForRequest is the retval of setupSpanForIncomingRPC. It groups together a
@@ -2018,7 +2058,7 @@ func setupSpanForIncomingRPC(
 			tracing.WithServerSpanKind)
 	}
 
-	if newSpan != nil && !newSpan.IsNoop() {
+	if newSpan != nil {
 		newSpan.SetLazyTag("request", ba.ShallowCopy())
 	}
 	return ctx, spanForRequest{
@@ -2170,8 +2210,8 @@ func makePerConsumerScanLimiter(
 // defaultRangefeedConsumerID returns a random ConsumerID. Used by
 // MuxRangeFeed calls where the user hasn't specified a consumer ID.
 func (n *Node) defaultRangefeedConsumerID() int64 {
-	return int64(builtins.GenerateUniqueInt(
-		builtins.ProcessUniqueID(n.execCfg.NodeInfo.NodeID.SQLInstanceID())))
+	return unique.GenerateUniqueInt(
+		unique.ProcessUniqueID(n.execCfg.NodeInfo.NodeID.SQLInstanceID()))
 }
 
 // MuxRangeFeed implements the roachpb.InternalServer interface.

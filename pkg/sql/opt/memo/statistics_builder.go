@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -228,18 +229,20 @@ const (
 //
 // See props/statistics.go for more details.
 type statisticsBuilder struct {
-	ctx     context.Context
-	evalCtx *eval.Context
-	md      *opt.Metadata
+	ctx         context.Context
+	evalCtx     *eval.Context
+	md          *opt.Metadata
+	minRowCount float64
 }
 
 func (sb *statisticsBuilder) init(ctx context.Context, evalCtx *eval.Context, md *opt.Metadata) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*sb = statisticsBuilder{
-		ctx:     ctx,
-		evalCtx: evalCtx,
-		md:      md,
+		ctx:         ctx,
+		evalCtx:     evalCtx,
+		md:          md,
+		minRowCount: evalCtx.SessionData().OptimizerMinRowCount,
 	}
 }
 
@@ -635,7 +638,7 @@ func (sb *statisticsBuilder) makeTableStatistics(tabID opt.TableID) *props.Stati
 	invertedIndexCols := make(map[int]invertedIndexColInfo)
 	for indexI, indexN := 0, tab.IndexCount(); indexI < indexN; indexI++ {
 		index := tab.Index(indexI)
-		if !index.IsInverted() {
+		if index.Type() != idxtype.INVERTED {
 			continue
 		}
 		col := index.InvertedColumn()
@@ -836,7 +839,7 @@ func (sb *statisticsBuilder) colAvgSize(tabID opt.TableID, col opt.ColumnID) uin
 
 func (sb *statisticsBuilder) buildScan(scan *ScanExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1085,7 +1088,7 @@ func (sb *statisticsBuilder) colStatScan(colSet opt.ColSet, scan *ScanExpr) *pro
 
 func (sb *statisticsBuilder) buildSelect(sel *SelectExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1126,7 +1129,7 @@ func (sb *statisticsBuilder) colStatSelect(
 
 func (sb *statisticsBuilder) buildProject(prj *ProjectExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1228,7 +1231,7 @@ func (sb *statisticsBuilder) buildInvertedFilter(
 	invFilter *InvertedFilterExpr, relProps *props.Relational,
 ) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1289,7 +1292,7 @@ func (sb *statisticsBuilder) buildJoin(
 	}
 
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1820,7 +1823,7 @@ func (sb *statisticsBuilder) colStatFromJoinRight(
 
 func (sb *statisticsBuilder) buildIndexJoin(indexJoin *IndexJoinExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1901,7 +1904,7 @@ func (sb *statisticsBuilder) buildZigzagJoin(
 	zigzag *ZigzagJoinExpr, relProps *props.Relational, h *joinPropsHelper,
 ) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -1947,8 +1950,8 @@ func (sb *statisticsBuilder) buildZigzagJoin(
 	// join ends up having a higher row count and therefore higher cost than
 	// a competing index join + constrained scan.
 	tab := sb.md.Table(zigzag.LeftTable)
-	leftIndexInverted := tab.Index(zigzag.LeftIndex).IsInverted()
-	rightIndexInverted := tab.Index(zigzag.RightIndex).IsInverted()
+	leftIndexInverted := tab.Index(zigzag.LeftIndex).Type() == idxtype.INVERTED
+	rightIndexInverted := tab.Index(zigzag.RightIndex).Type() == idxtype.INVERTED
 	if leftIndexInverted {
 		unapplied.unknown += len(zigzag.LeftFixedCols) * 2
 	}
@@ -2002,7 +2005,7 @@ func (sb *statisticsBuilder) buildZigzagJoin(
 
 func (sb *statisticsBuilder) buildGroupBy(groupNode RelExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2114,7 +2117,7 @@ func (sb *statisticsBuilder) colStatGroupBy(
 
 func (sb *statisticsBuilder) buildSetNode(setNode RelExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2219,7 +2222,7 @@ func (sb *statisticsBuilder) colStatSetNodeImpl(
 // buildValues builds the statistics for a VALUES expression.
 func (sb *statisticsBuilder) buildValues(values ValuesContainer, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2324,7 +2327,7 @@ func (sb *statisticsBuilder) colStatLiteralValues(
 
 func (sb *statisticsBuilder) buildLimit(limit *LimitExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2367,7 +2370,7 @@ func (sb *statisticsBuilder) colStatLimit(
 
 func (sb *statisticsBuilder) buildTopK(topK *TopKExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2409,7 +2412,7 @@ func (sb *statisticsBuilder) colStatTopK(colSet opt.ColSet, topK *TopKExpr) *pro
 
 func (sb *statisticsBuilder) buildOffset(offset *OffsetExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2462,7 +2465,7 @@ func (sb *statisticsBuilder) colStatOffset(
 
 func (sb *statisticsBuilder) buildMax1Row(max1Row *Max1RowExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2492,7 +2495,7 @@ func (sb *statisticsBuilder) colStatMax1Row(
 
 func (sb *statisticsBuilder) buildOrdinality(ord *OrdinalityExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2537,7 +2540,7 @@ func (sb *statisticsBuilder) colStatOrdinality(
 
 func (sb *statisticsBuilder) buildWindow(window *WindowExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2605,7 +2608,7 @@ func (sb *statisticsBuilder) buildProjectSet(
 	projectSet *ProjectSetExpr, relProps *props.Relational,
 ) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2738,7 +2741,7 @@ func (sb *statisticsBuilder) buildWithScan(
 	withScan *WithScanExpr, relProps, bindingProps *props.Relational,
 ) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2780,7 +2783,7 @@ func (sb *statisticsBuilder) colStatWithScan(
 
 func (sb *statisticsBuilder) buildMutation(mutation RelExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2818,7 +2821,7 @@ func (sb *statisticsBuilder) colStatMutation(
 
 func (sb *statisticsBuilder) buildLock(lock *LockExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2852,7 +2855,7 @@ func (sb *statisticsBuilder) buildVectorSearch(
 	search *VectorSearchExpr, relProps *props.Relational,
 ) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2909,7 +2912,7 @@ func (sb *statisticsBuilder) buildVectorPartitionSearch(
 	search *VectorPartitionSearchExpr, relProps *props.Relational,
 ) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2944,7 +2947,7 @@ func (sb *statisticsBuilder) colStatVectorPartitionSearch(
 
 func (sb *statisticsBuilder) buildBarrier(barrier *BarrierExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short cut if cardinality is 0.
 		return
 	}
@@ -2978,7 +2981,7 @@ func (sb *statisticsBuilder) colStatBarrier(
 
 func (sb *statisticsBuilder) buildCall(call *CallExpr, relProps *props.Relational) {
 	s := relProps.Statistics()
-	if zeroCardinality := s.Init(relProps); zeroCardinality {
+	if zeroCardinality := s.Init(relProps, sb.minRowCount); zeroCardinality {
 		// Short-cut if cardinality is 0.
 		return
 	}
@@ -5254,9 +5257,16 @@ func (sb *statisticsBuilder) factorOutVirtualCols(
 		}
 		expr, ok := tab.ComputedCols[colID]
 		if !ok {
-			panic(errors.AssertionFailedf(
-				"could not find computed column expression for column %v in table %v", colID, tab.Alias,
-			))
+			// If we can't find the computed column expression, this is probably a
+			// mutation column. Whatever the reason, it's safe to skip: we simply
+			// won't factor out matching expressions.
+			if buildutil.CrdbTestBuild &&
+				!tab.Table.Column(tab.MetaID.ColumnOrdinal(colID)).IsMutation() {
+				panic(errors.AssertionFailedf(
+					"could not find computed column expression for column %v in table %v", colID, tab.Alias,
+				))
+			}
+			return
 		}
 		virtExprs = append(virtExprs, virtExpr{colID: colID, expr: expr})
 	})

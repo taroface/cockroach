@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net/url"
 	"os"
@@ -111,21 +112,21 @@ func TestCloudStorageSink(t *testing.T) {
 			return false
 		}
 
-		walkFn := func(path string, info os.FileInfo, err error) error {
+		walkDirFn := func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if path == absRoot {
 				return nil
 			}
-			if info.IsDir() && !hasChildDirs(path) {
+			if d.IsDir() && !hasChildDirs(path) {
 				relPath, _ := filepath.Rel(absRoot, path)
 				folders = append(folders, relPath)
 			}
 			return nil
 		}
 
-		require.NoError(t, filepath.Walk(absRoot, walkFn))
+		require.NoError(t, filepath.WalkDir(absRoot, walkDirFn))
 		return folders
 	}
 
@@ -133,11 +134,11 @@ func TestCloudStorageSink(t *testing.T) {
 	// temp dir created above), sorted by the name of the file.
 	slurpDir := func(t *testing.T) []string {
 		var files []string
-		walkFn := func(path string, info os.FileInfo, err error) error {
+		walkDirFn := func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
-			if info.IsDir() {
+			if d.IsDir() {
 				return nil
 			}
 			file, err := os.ReadFile(path)
@@ -152,13 +153,12 @@ func TestCloudStorageSink(t *testing.T) {
 		}
 		absRoot := filepath.Join(externalIODir, testDir(t))
 		require.NoError(t, os.MkdirAll(absRoot, 0755))
-		require.NoError(t, filepath.Walk(absRoot, walkFn))
+		require.NoError(t, filepath.WalkDir(absRoot, walkDirFn))
 		return files
 	}
 
 	var noKey []byte
 	settings := cluster.MakeTestingClusterSettings()
-	settings.ExternalIODir = externalIODir
 	opts := changefeedbase.EncodingOptions{
 		Format:     changefeedbase.OptFormatJSON,
 		Envelope:   changefeedbase.OptEnvelopeWrapped,
@@ -169,7 +169,7 @@ func TestCloudStorageSink(t *testing.T) {
 	e, err := makeJSONEncoder(ctx, jsonEncoderOptions{EncodingOptions: opts})
 	require.NoError(t, err)
 
-	clientFactory := blobs.TestBlobServiceClient(settings.ExternalIODir)
+	clientFactory := blobs.TestBlobServiceClient(externalIODir)
 	externalStorageFromURI := func(ctx context.Context, uri string, user username.SQLUsername, opts ...cloud.ExternalStorageOption) (cloud.ExternalStorage,
 		error) {
 		var options cloud.ExternalStorageOptions
@@ -605,7 +605,7 @@ func TestCloudStorageSink(t *testing.T) {
 					timestampOracle := &changeAggregatorLowerBoundOracle{sf: sf}
 
 					sinkURIWithParam := sinkURI(t, targetMaxFileSize)
-					sinkURIWithParam.addParam(changefeedbase.SinkParamPartitionFormat, tc.format)
+					sinkURIWithParam.AddParam(changefeedbase.SinkParamPartitionFormat, tc.format)
 					t.Logf("format=%s sinkgWithParam: %s", tc.format, sinkURIWithParam.String())
 					s, err := makeCloudStorageSink(
 						ctx, sinkURIWithParam, 1, settings, opts,
@@ -944,12 +944,12 @@ func testDir(t *testing.T) string {
 	return strings.ReplaceAll(t.Name(), "/", ";")
 }
 
-func sinkURI(t *testing.T, maxFileSize int64) sinkURL {
+func sinkURI(t *testing.T, maxFileSize int64) *changefeedbase.SinkURL {
 	u, err := url.Parse(fmt.Sprintf("nodelocal://1/%s", testDir(t)))
 	require.NoError(t, err)
-	sink := sinkURL{URL: u}
+	sink := &changefeedbase.SinkURL{URL: u}
 	if maxFileSize != unlimitedFileSize {
-		sink.addParam(changefeedbase.SinkParamFileSize, strconv.FormatInt(maxFileSize, 10))
+		sink.AddParam(changefeedbase.SinkParamFileSize, strconv.FormatInt(maxFileSize, 10))
 	}
 	return sink
 }

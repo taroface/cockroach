@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
@@ -51,7 +52,8 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 	idxSpec.secondary = &scpb.SecondaryIndex{
 		Index: scpb.Index{
 			IsUnique:       n.Unique,
-			IsInverted:     n.Inverted,
+			IsInverted:     n.Type == idxtype.INVERTED,
+			Type:           n.Type,
 			IsConcurrently: n.Concurrently,
 			IsNotVisible:   n.Invisibility.Value != 0.0,
 			Invisibility:   n.Invisibility.Value,
@@ -144,22 +146,26 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 	}
 	panicIfSchemaChangeIsDisallowed(relationElements, n)
 
-	// Vector indexes are note yet supported.
-	if n.Vector {
+	// Vector indexes are not yet supported.
+	if n.Type == idxtype.VECTOR {
 		panic(unimplemented.NewWithIssuef(137370, "VECTOR indexes are not yet supported"))
 	}
 
+	if !n.Type.SupportsSharding() && n.Sharded != nil {
+		panic(pgerror.Newf(pgcode.InvalidSQLStatementName,
+			"%s indexes don't support hash sharding", strings.ToLower(n.Type.String())))
+	}
+	if !n.Type.SupportsStoring() && len(n.Storing) > 0 {
+		panic(pgerror.Newf(pgcode.InvalidSQLStatementName,
+			"%s indexes don't support stored columns", strings.ToLower(n.Type.String())))
+	}
+	if !n.Type.CanBeUnique() && n.Unique {
+		panic(pgerror.Newf(pgcode.InvalidSQLStatementName,
+			"%s indexes can't be unique", strings.ToLower(n.Type.String())))
+	}
+
 	// Inverted indexes do not support hash sharding or unique.
-	if n.Inverted {
-		if n.Sharded != nil {
-			panic(pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support hash sharding"))
-		}
-		if len(n.Storing) > 0 {
-			panic(pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes don't support stored columns"))
-		}
-		if n.Unique {
-			panic(pgerror.New(pgcode.InvalidSQLStatementName, "inverted indexes can't be unique"))
-		}
+	if n.Type == idxtype.INVERTED {
 		b.IncrementSchemaChangeIndexCounter("inverted")
 		if len(n.Columns) > 1 {
 			b.IncrementSchemaChangeIndexCounter("multi_column_inverted")
@@ -179,7 +185,7 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 	maybeAddIndexPredicate(b, n, &idxSpec)
 	// Picks up any geoconfig parameters, hash sharded one are
 	// picked independently.
-	maybeApplyStorageParameters(b, n, &idxSpec)
+	maybeApplyStorageParameters(b, n.StorageParams, &idxSpec)
 	// Assign the secondary constraint ID now, since we may have added a check
 	// constraint earlier.
 	if idxSpec.secondary.IsUnique {
@@ -301,16 +307,17 @@ func processColNodeType(
 ) catpb.InvertedIndexColumnKind {
 	invertedKind := catpb.InvertedIndexColumnKind_DEFAULT
 	// OpClass are only allowed for the last column of an inverted index.
-	if columnNode.OpClass != "" && (!lastColIdx || !n.Inverted) {
+	if columnNode.OpClass != "" && (!lastColIdx || !n.Type.SupportsOpClass()) {
 		panic(pgerror.New(pgcode.DatatypeMismatch,
 			"operator classes are only allowed for the last column of an inverted index"))
 	}
-	// Disallow descending last columns in inverted indexes.
-	if n.Inverted && columnNode.Direction == tree.Descending && lastColIdx {
+	// Disallow descending last column in inverted indexes because they have no
+	// linear ordering.
+	if !n.Type.HasLinearOrdering() && columnNode.Direction == tree.Descending && lastColIdx {
 		panic(pgerror.New(pgcode.FeatureNotSupported,
 			"the last column in an inverted index cannot have the DESC option"))
 	}
-	if n.Inverted && lastColIdx {
+	if n.Type.SupportsOpClass() && lastColIdx {
 		switch columnType.Type.Family() {
 		case types.ArrayFamily:
 			switch columnNode.OpClass {
@@ -375,21 +382,17 @@ func processColNodeType(
 		})
 	}
 	// Only certain column types are supported for inverted indexes.
-	if n.Inverted && lastColIdx &&
+	if n.Type == idxtype.INVERTED && lastColIdx &&
 		!colinfo.ColumnTypeIsInvertedIndexable(columnType.Type) {
 		colNameForErr := colName
 		if columnNode.Expr != nil {
 			colNameForErr = columnNode.Expr.String()
 		}
-		panic(tabledesc.NewInvalidInvertedColumnError(colNameForErr,
-			columnType.Type.String()))
-	} else if (!n.Inverted || !lastColIdx) && !colinfo.ColumnTypeIsIndexable(columnType.Type) {
+		panic(sqlerrors.NewInvalidLastColumnError(colNameForErr, columnType.Type.String(), n.Type))
+	} else if (n.Type != idxtype.INVERTED || !lastColIdx) && !colinfo.ColumnTypeIsIndexable(columnType.Type) {
 		// Otherwise, check if the column type is indexable.
-		panic(unimplemented.NewWithIssueDetailf(35730,
-			columnType.Type.DebugString(),
-			"column %s is of type %s and thus is not indexable",
-			colName,
-			columnType.Type))
+		panic(sqlerrors.NewColumnNotIndexableError(
+			colName, columnType.Type.String(), columnType.Type.DebugString()))
 	}
 	return invertedKind
 }
@@ -488,7 +491,7 @@ func maybeAddPartitionDescriptorForIndex(b BuildCtx, n *tree.CreateIndex, idxSpe
 			columnsToPrepend = append(columnsToPrepend, newIndexColumn)
 		}
 		idxSpec.columns = append(columnsToPrepend, idxSpec.columns...)
-		if n.Inverted {
+		if n.Type == idxtype.INVERTED {
 			b.IncrementSchemaChangeIndexCounter("partitioned_inverted")
 		}
 	}
@@ -565,7 +568,7 @@ func addColumnsForSecondaryIndex(
 			// Add column needs to support materialized views for the
 			// declarative schema changer to work.
 			fallbackIfRelationIsNotTable(n, relation)
-			colNameStr := maybeCreateVirtualColumnForIndex(b, n, &n.Table, relation.(*scpb.Table), columnNode.Expr, n.Inverted, i == len(n.Columns)-1)
+			colNameStr := maybeCreateVirtualColumnForIndex(b, n, &n.Table, relation.(*scpb.Table), columnNode.Expr, n.Type, i == len(n.Columns)-1)
 			colName = tree.Name(colNameStr)
 			if !expressionTelemtryCounted {
 				b.IncrementSchemaChangeIndexCounter("expression")
@@ -793,7 +796,7 @@ func maybeCreateVirtualColumnForIndex(
 	tn *tree.TableName,
 	tbl *scpb.Table,
 	expr tree.Expr,
-	inverted bool,
+	typ idxtype.T,
 	lastColumn bool,
 ) string {
 	validateColumnIndexableType := func(t *types.T) {
@@ -807,10 +810,8 @@ func maybeCreateVirtualColumnForIndex(
 				"consider adding a type cast to the expression",
 			))
 		}
-		// Check if the column type is indexable,
-		// non-inverted types.
-		if !inverted &&
-			!colinfo.ColumnTypeIsIndexable(t) {
+		// Check if the column type is indexable for forward indexes.
+		if typ == idxtype.FORWARD && !colinfo.ColumnTypeIsIndexable(t) {
 			panic(pgerror.Newf(
 				pgcode.InvalidTableDefinition,
 				"index element %s of type %s is not indexable",
@@ -818,9 +819,7 @@ func maybeCreateVirtualColumnForIndex(
 				t.Name()))
 		}
 		// Check if inverted columns are invertible.
-		if inverted &&
-			!lastColumn &&
-			!colinfo.ColumnTypeIsIndexable(t) {
+		if typ == idxtype.INVERTED && !lastColumn && !colinfo.ColumnTypeIsIndexable(t) {
 			panic(errors.WithHint(
 				pgerror.Newf(
 					pgcode.InvalidTableDefinition,
@@ -831,9 +830,7 @@ func maybeCreateVirtualColumnForIndex(
 				"see the documentation for more information about inverted indexes: "+docs.URL("inverted-indexes.html"),
 			))
 		}
-		if inverted &&
-			lastColumn &&
-			!colinfo.ColumnTypeIsInvertedIndexable(t) {
+		if typ == idxtype.INVERTED && lastColumn && !colinfo.ColumnTypeIsInvertedIndexable(t) {
 			panic(errors.WithHint(
 				pgerror.Newf(
 					pgcode.InvalidTableDefinition,
@@ -914,31 +911,31 @@ func maybeAddIndexPredicate(b BuildCtx, n *tree.CreateIndex, idxSpec *indexSpec)
 	expr := b.PartialIndexPredicateExpression(idxSpec.secondary.TableID, n.Predicate)
 	idxSpec.secondary.EmbeddedExpr = b.WrapExpression(idxSpec.secondary.TableID, expr)
 	b.IncrementSchemaChangeIndexCounter("partial")
-	if n.Inverted {
+	if n.Type == idxtype.INVERTED {
 		b.IncrementSchemaChangeIndexCounter("partial_inverted")
 	}
 }
 
 // maybeApplyStorageParameters apply any storage parameters into the index spec,
 // this is only used for GeoConfig today.
-func maybeApplyStorageParameters(b BuildCtx, n *tree.CreateIndex, idxSpec *indexSpec) {
-	if len(n.StorageParams) == 0 {
+func maybeApplyStorageParameters(b BuildCtx, storageParams tree.StorageParams, idxSpec *indexSpec) {
+	if len(storageParams) == 0 {
 		return
 	}
 	dummyIndexDesc := &descpb.IndexDescriptor{}
-	if idxSpec.secondary.GeoConfig != nil {
+	if idxSpec.secondary != nil && idxSpec.secondary.GeoConfig != nil {
 		dummyIndexDesc.GeoConfig = *idxSpec.secondary.GeoConfig
 	}
 	storageParamSetter := &indexstorageparam.Setter{
 		IndexDesc: dummyIndexDesc,
 	}
-	err := storageparam.Set(b, b.SemaCtx(), b.EvalCtx(), n.StorageParams, storageParamSetter)
+	err := storageparam.Set(b, b.SemaCtx(), b.EvalCtx(), storageParams, storageParamSetter)
 	if err != nil {
 		panic(err)
 	}
-	if !dummyIndexDesc.GeoConfig.IsEmpty() {
+	if idxSpec.secondary != nil && !dummyIndexDesc.GeoConfig.IsEmpty() {
 		idxSpec.secondary.GeoConfig = &dummyIndexDesc.GeoConfig
-	} else {
+	} else if idxSpec.secondary != nil {
 		idxSpec.secondary.GeoConfig = nil
 	}
 }

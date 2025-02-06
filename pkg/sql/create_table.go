@@ -46,6 +46,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
@@ -91,7 +92,7 @@ func (p *planner) getNonTemporarySchemaForCreate(
 	case catalog.SchemaPublic:
 		return sc, nil
 	case catalog.SchemaUserDefined:
-		sc, err := p.Descriptors().MutableByID(p.txn).Schema(ctx, sc.GetID())
+		sc, err = p.Descriptors().ByIDWithoutLeased(p.Txn()).Get().Schema(ctx, sc.GetID())
 		if err != nil {
 			return nil, err
 		}
@@ -1862,6 +1863,21 @@ func NewTableDesc(
 				}
 				col.ColumnDesc().ComputeExpr = &serializedExpr
 			}
+
+			// Validate storage parameters for
+			// CREATE TABLE ... (x INT PRIMARY KEY USING HASH WITH (...));
+			if d.PrimaryKey.IsPrimaryKey {
+				if err := storageparam.Set(
+					ctx,
+					semaCtx,
+					evalCtx,
+					d.PrimaryKey.StorageParams,
+					&indexstorageparam.Setter{
+						IndexDesc: &descpb.IndexDescriptor{},
+					}); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 
@@ -1871,9 +1887,6 @@ func NewTableDesc(
 			// pass, handled above.
 
 		case *tree.IndexTableDef:
-			if d.Vector {
-				return nil, unimplemented.NewWithIssuef(137370, "VECTOR indexes are not yet supported")
-			}
 			// If the index is named, ensure that the name is unique. Unnamed
 			// indexes will be given a unique auto-generated name later on when
 			// AllocateIDs is called.
@@ -1895,14 +1908,14 @@ func NewTableDesc(
 				&desc,
 				&n.Table,
 				d.Columns,
-				d.Inverted,
+				d.Type,
 				true, /* isNewTable */
 				semaCtx,
 				version,
 			); err != nil {
 				return nil, err
 			}
-			if err := checkIndexColumns(&desc, d.Columns, d.Storing, d.Inverted, version); err != nil {
+			if err := checkIndexColumns(&desc, d.Columns, d.Storing, d.Type, version); err != nil {
 				return nil, err
 			}
 			idx := descpb.IndexDescriptor{
@@ -1911,9 +1924,7 @@ func NewTableDesc(
 				Version:          indexEncodingVersion,
 				NotVisible:       d.Invisibility.Value != 0.0,
 				Invisibility:     d.Invisibility.Value,
-			}
-			if d.Inverted {
-				idx.Type = descpb.IndexDescriptor_INVERTED
+				Type:             d.Type,
 			}
 			columns := d.Columns
 			if d.Sharded != nil {
@@ -1926,7 +1937,7 @@ func NewTableDesc(
 			if err := idx.FillColumns(columns); err != nil {
 				return nil, err
 			}
-			if d.Inverted {
+			if d.Type == idxtype.INVERTED {
 				column, err := catalog.MustFindColumnByName(&desc, idx.InvertedColumnName())
 				if err != nil {
 					return nil, err
@@ -1935,6 +1946,14 @@ func NewTableDesc(
 					ctx, evalCtx.Settings, column, &idx, columns[len(columns)-1]); err != nil {
 					return nil, err
 				}
+			}
+			if d.Type == idxtype.VECTOR {
+				column, err := catalog.MustFindColumnByName(&desc, idx.VectorColumnName())
+				if err != nil {
+					return nil, err
+				}
+				idx.VecConfig.Dims = column.GetType().Width()
+				idx.VecConfig.Seed = evalCtx.GetRNG().Int63()
 			}
 
 			var idxPartitionBy *tree.PartitionBy
@@ -2015,14 +2034,14 @@ func NewTableDesc(
 				&desc,
 				&n.Table,
 				d.Columns,
-				false, /* isInverted */
-				true,  /* isNewTable */
+				d.Type,
+				true, /* isNewTable */
 				semaCtx,
 				version,
 			); err != nil {
 				return nil, err
 			}
-			if err := checkIndexColumns(&desc, d.Columns, d.Storing, d.Inverted, version); err != nil {
+			if err := checkIndexColumns(&desc, d.Columns, d.Storing, d.Type, version); err != nil {
 				return nil, err
 			}
 			idx := descpb.IndexDescriptor{
@@ -2112,6 +2131,18 @@ func NewTableDesc(
 				if err := desc.AddSecondaryIndex(idx); err != nil {
 					return nil, err
 				}
+			}
+
+			// Validate storage parameters for
+			// CREATE TABLE ... (x INT, PRIMARY KEY (x) USING HASH WITH (...));
+			if err := storageparam.Set(
+				ctx,
+				semaCtx,
+				evalCtx,
+				d.StorageParams,
+				&indexstorageparam.Setter{IndexDesc: &idx},
+			); err != nil {
+				return nil, err
 			}
 		case *tree.CheckConstraintTableDef, *tree.ForeignKeyConstraintTableDef, *tree.FamilyTableDef:
 			// pass, handled below.
@@ -2344,7 +2375,7 @@ func NewTableDesc(
 		if idx.IsSharded() {
 			telemetry.Inc(sqltelemetry.HashShardedIndexCounter)
 		}
-		if idx.GetType() == descpb.IndexDescriptor_INVERTED {
+		if idx.GetType() == idxtype.INVERTED {
 			telemetry.Inc(sqltelemetry.InvertedIndexCounter)
 			geoConfig := idx.GetGeoConfig()
 			if !geoConfig.IsEmpty() {
@@ -2365,6 +2396,12 @@ func NewTableDesc(
 			}
 			if idx.PartitioningColumnCount() != 0 {
 				telemetry.Inc(sqltelemetry.PartitionedInvertedIndexCounter)
+			}
+		}
+		if idx.GetType() == idxtype.VECTOR {
+			telemetry.Inc(sqltelemetry.VectorIndexCounter)
+			if idx.NumKeyColumns() > 1 {
+				telemetry.Inc(sqltelemetry.MultiColumnVectorIndexCounter)
 			}
 		}
 		if idx.IsPartial() {
@@ -2745,7 +2782,7 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 				}
 				indexDef := tree.IndexTableDef{
 					Name:         tree.Name(idx.GetName()),
-					Inverted:     idx.GetType() == descpb.IndexDescriptor_INVERTED,
+					Type:         idx.GetType(),
 					Storing:      make(tree.NameList, 0, idx.NumSecondaryStoredColumns()),
 					Columns:      make(tree.IndexElemList, 0, idx.NumKeyColumns()),
 					Invisibility: tree.IndexInvisibility{Value: idx.GetInvisibility()},
@@ -2782,9 +2819,9 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 					}
 					indexDef.Columns = append(indexDef.Columns, elem)
 				}
-				// The last column of an inverted index cannot have an explicit
-				// direction.
-				if indexDef.Inverted {
+				// The last column of an inverted or vector index cannot have an
+				// explicit direction, because it does not have a linear ordering.
+				if !indexDef.Type.HasLinearOrdering() {
 					indexDef.Columns[len(indexDef.Columns)-1].Direction = tree.DefaultDirection
 				}
 				for j := 0; j < idx.NumSecondaryStoredColumns(); j++ {

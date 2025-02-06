@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
@@ -605,13 +606,19 @@ func registerKVGracefulDraining(r registry.Registry) {
 			// meet its qps targets.
 			require.NoError(t, roachtestutil.ProfileTopStatements(ctx, c, t.L(), roachtestutil.ProfDbName("kv")))
 			defer func() {
+				// In cases where the test fails, the supplied context will be
+				// cancelled, and we'll be left with squat. Download profiles using a
+				// separate context.
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				defer cancel()
+
 				if err := roachtestutil.DownloadProfiles(ctx, c, t.L(), t.ArtifactsDir()); err != nil {
 					t.L().PrintfCtx(ctx, "failed to download stmt bundles: %v", err)
 				}
 			}()
 
 			verifyQPS := func(ctx context.Context) error {
-				if qps := roachtestutil.MeasureQPS(ctx, t, c, time.Second, c.Range(1, nodes-1)); qps < expectedQPS {
+				if qps := roachtestutil.MeasureQPS(ctx, t, c, base.DefaultMetricsSampleInterval, c.Range(1, nodes-1)); qps < expectedQPS {
 					return errors.Newf(
 						"QPS of %.2f at time %v is below minimum allowable QPS of %.2f",
 						qps, timeutil.Now(), expectedQPS)

@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationutils"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/streamclient"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/jobs/ingeststopped"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/repstream/streampb"
@@ -70,6 +71,7 @@ var (
 )
 
 var errOfflineInitialScanComplete = errors.New("spinning down offline initial scan")
+var maxWait = time.Minute * 5
 
 type logicalReplicationResumer struct {
 	job *jobs.Job
@@ -83,12 +85,16 @@ func (r *logicalReplicationResumer) Resume(ctx context.Context, execCtx interfac
 	return r.handleResumeError(ctx, jobExecCtx, r.ingestWithRetries(ctx, jobExecCtx))
 }
 
-// The ingestion job should never fail, only pause, as progress should never be lost.
+// The ingestion job should always pause, unless the error is marked as a permanent job error.
 func (r *logicalReplicationResumer) handleResumeError(
 	ctx context.Context, execCtx sql.JobExecContext, err error,
 ) error {
 	if err == nil {
 		return nil
+	}
+	if jobs.IsPermanentJobError(err) {
+		r.updateRunningStatus(ctx, redact.Sprintf("permanent error: %s", err.Error()))
+		return err
 	}
 	r.updateRunningStatus(ctx, redact.Sprintf("pausing after error: %s", err.Error()))
 	return jobs.MarkPauseRequestError(err)
@@ -166,6 +172,14 @@ func (r *logicalReplicationResumer) ingest(
 	}
 	defer func() { _ = client.Close(ctx) }()
 
+	status, err := client.Heartbeat(ctx, streampb.StreamID(payload.StreamID), progress.ReplicatedTime)
+	if err != nil {
+		log.Warningf(ctx, "could not heartbeat source cluster with stream id %d", payload.StreamID)
+	}
+	if status.StreamStatus == streampb.StreamReplicationStatus_STREAM_INACTIVE {
+		return jobs.MarkAsPermanentJobError(errors.Newf("history retention job is no longer active"))
+	}
+
 	if err := r.maybeStartReverseStream(ctx, jobExecCtx, client); err != nil {
 		return err
 	}
@@ -190,13 +204,18 @@ func (r *logicalReplicationResumer) ingest(
 	if err != nil {
 		return err
 	}
-	if err := r.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-		ldrProg := md.Progress.Details.(*jobspb.Progress_LogicalReplication).LogicalReplication
-		ldrProg.PartitionConnUris = planInfo.partitionPgUrls
-		ju.UpdateProgress(md.Progress)
-		return nil
-	}); err != nil {
-		return err
+
+	// If the routing mode is gateway, we don't want to checkpoint addresses
+	// since they may not be in the same network.
+	if uris[0].RoutingMode() != streamclient.RoutingModeGateway {
+		if err := r.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+			ldrProg := md.Progress.Details.(*jobspb.Progress_LogicalReplication).LogicalReplication
+			ldrProg.PartitionConnUris = planInfo.partitionPgUrls
+			ju.UpdateProgress(md.Progress)
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 	// Update the local progress copy as it was just updated.
 	progress = r.job.Progress().Details.(*jobspb.Progress_LogicalReplication).LogicalReplication
@@ -320,11 +339,6 @@ func (r *logicalReplicationResumer) maybeStartReverseStream(
 		return errors.Wrapf(err, "failed to start reverse stream")
 	}
 
-	// TODO(msbutler): if the job exits before we write here but after setting up
-	// the reverse stream, we will accidentally create a second reverse stream. To
-	// prevent this, the PARENT option will passed to the reverse stream, then
-	// during ldr stream creation, the planhook checks if any job is already
-	// running with this parent job id.
 	if err := r.job.NoTxn().Update(ctx, func(txn isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
 		md.Progress.Details.(*jobspb.Progress_LogicalReplication).LogicalReplication.StartedReverseStream = true
 		ju.UpdateProgress(md.Progress)
@@ -350,6 +364,12 @@ func (r *logicalReplicationResumer) maybePublishCreatedTables(
 	if details.ReverseStreamCommand != "" && !progress.StartedReverseStream {
 		return errors.AssertionFailedf("attempting to publish descriptors before starting reverse stream")
 	}
+
+	if err := ingeststopped.WaitForNoIngestingNodes(ctx, jobExecCtx, r.job, maxWait); err != nil {
+		return errors.Wrapf(err, "unable to verify that attempted LDR job %d had stopped offline ingesting %s", r.job.ID(), maxWait)
+	}
+	log.Infof(ctx, "verified no nodes still offline ingesting on behalf of job %d", r.job.ID())
+
 	return sql.DescsTxn(ctx, jobExecCtx.ExecCfg(), func(ctx context.Context, txn isql.Txn, descCol *descs.Collection) error {
 		b := txn.KV().NewBatch()
 		for i := range details.IngestedExternalCatalog.Tables {
@@ -740,9 +760,11 @@ func (rh *rowHandler) handleRow(ctx context.Context, row tree.Datums) error {
 			return err
 		}
 	}
+	replicatedTime := rh.frontier.Frontier()
+	alwaysPersist := rh.replicatedTimeAtStart.Less(replicatedTime) && rh.replicatedTimeAtStart.IsEmpty()
 
 	updateFreq := jobCheckpointFrequency.Get(rh.settings)
-	if updateFreq == 0 || timeutil.Since(rh.lastPartitionUpdate) < updateFreq {
+	if !alwaysPersist && (updateFreq == 0 || timeutil.Since(rh.lastPartitionUpdate) < updateFreq) {
 		return nil
 	}
 
@@ -751,7 +773,6 @@ func (rh *rowHandler) handleRow(ctx context.Context, row tree.Datums) error {
 		frontierResolvedSpans = append(frontierResolvedSpans, jobspb.ResolvedSpan{Span: sp, Timestamp: ts})
 		return span.ContinueMatch
 	})
-	replicatedTime := rh.frontier.Frontier()
 
 	rh.lastPartitionUpdate = timeutil.Now()
 	log.VInfof(ctx, 2, "persisting replicated time of %s", replicatedTime.GoTime())
@@ -887,6 +908,11 @@ func (r *logicalReplicationResumer) OnFailOrCancel(
 		return err
 	}
 	if details.CreateTable && !progress.PublishedNewTables {
+		if err := ingeststopped.WaitForNoIngestingNodes(ctx, jobExecCtx, r.job, maxWait); err != nil {
+			log.Errorf(ctx, "unable to verify that attempted LDR job %d had stopped offline ingesting %s: %v", r.job.ID(), maxWait, err)
+		} else {
+			log.Infof(ctx, "verified no nodes still offline ingesting on behalf of job %d", r.job.ID())
+		}
 		if err := execCfg.InternalDB.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
 			return externalcatalog.DropIngestedExternalCatalog(ctx, execCfg, jobExecCtx.User(), details.IngestedExternalCatalog, txn, execCfg.JobRegistry, txn.Descriptors(), fmt.Sprintf("gc for ldr job %d", r.job.ID()))
 		}); err != nil {

@@ -742,6 +742,17 @@ var overrideAlterPrimaryRegionInSuperRegion = settings.RegisterBoolSetting(
 	false,
 	settings.WithPublic)
 
+var planCacheClusterMode = settings.RegisterEnumSetting(
+	settings.ApplicationLevel,
+	"sql.defaults.plan_cache_mode",
+	"default value for plan_cache_mode session setting",
+	"auto",
+	map[sessiondatapb.PlanCacheMode]string{
+		sessiondatapb.PlanCacheModeForceCustom:  "force_custom_plan",
+		sessiondatapb.PlanCacheModeForceGeneric: "force_generic_plan",
+		sessiondatapb.PlanCacheModeAuto:         "auto",
+	})
+
 var errNoTransactionInProgress = pgerror.New(pgcode.NoActiveSQLTransaction, "there is no transaction in progress")
 var errTransactionInProgress = pgerror.New(pgcode.ActiveSQLTransaction, "there is already a transaction in progress")
 
@@ -1940,6 +1951,8 @@ type StreamingTestingKnobs struct {
 
 	SpanConfigRangefeedCacheKnobs *rangefeedcache.TestingKnobs
 
+	OnGetSQLInstanceInfo func(cluster *roachpb.NodeDescriptor) *roachpb.NodeDescriptor
+
 	FailureRate uint32
 }
 
@@ -2677,9 +2690,6 @@ func (st *SessionTracing) StartTracing(
 	if _, ok := st.ex.machine.CurState().(stateNoTxn); !ok {
 		txnCtx := st.ex.state.Ctx
 		sp := tracing.SpanFromContext(txnCtx)
-		if sp == nil {
-			return errors.Errorf("no txn span for SessionTracing")
-		}
 		// We're hijacking this span and we're never going to un-hijack it, so it's
 		// up to us to finish it.
 		sp.Finish()
@@ -3144,6 +3154,10 @@ type sessionDataMutatorCallbacks struct {
 	// setCurTxnReadOnly is called when we execute SET transaction_read_only = ...
 	// It can be nil, in which case nothing triggers on execution.
 	setCurTxnReadOnly func(readOnly bool) error
+	// setBufferedWritesEnabled is called when we execute SET kv_transaction_buffered_writes_enabled = ...
+	// It can be nil, in which case nothing triggers on execution (apart from
+	// modification of the session data).
+	setBufferedWritesEnabled func(enabled bool)
 	// upgradedIsolationLevel is called whenever the transaction isolation
 	// session variable is configured and the isolation level is automatically
 	// upgraded to a stronger one. It's also used when the isolation level is
@@ -3999,6 +4013,25 @@ func (m *sessionDataMutator) SetRecursionDepthLimit(val int) {
 
 func (m *sessionDataMutator) SetLegacyVarcharTyping(val bool) {
 	m.data.LegacyVarcharTyping = val
+}
+
+func (m *sessionDataMutator) SetCatalogDigestStalenessCheckEnabled(b bool) {
+	m.data.CatalogDigestStalenessCheckEnabled = b
+}
+
+func (m *sessionDataMutator) SetOptimizerPreferBoundedCardinality(b bool) {
+	m.data.OptimizerPreferBoundedCardinality = b
+}
+
+func (m *sessionDataMutator) SetOptimizerMinRowCount(val float64) {
+	m.data.OptimizerMinRowCount = val
+}
+
+func (m *sessionDataMutator) SetBufferedWritesEnabled(b bool) {
+	m.data.BufferedWritesEnabled = b
+	if m.setBufferedWritesEnabled != nil {
+		m.setBufferedWritesEnabled(b)
+	}
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

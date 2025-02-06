@@ -30,12 +30,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -68,11 +68,8 @@ func alterTableAddColumn(
 		panic(sqlerrors.NewColumnAlreadyExistsInRelationError(string(d.Name), tn.Object()))
 	}
 	var colSerialDefaultExpression *scpb.Expression
-	if d.IsSerial {
-		d, colSerialDefaultExpression = alterTableAddColumnSerial(b, d, tn)
-	}
-	if d.GeneratedIdentity.IsGeneratedAsIdentity {
-		panic(scerrors.NotImplementedErrorf(d, "contains generated identity type"))
+	if d.IsSerial || d.GeneratedIdentity.IsGeneratedAsIdentity {
+		d, colSerialDefaultExpression = alterTableAddColumnSerialOrGeneratedIdentity(b, d, tn)
 	}
 	// Unique without an index is unsupported.
 	if d.Unique.WithoutIndex {
@@ -166,10 +163,7 @@ func alterTableAddColumn(
 		!d.Unique.WithoutIndex &&
 		!colinfo.ColumnTypeIsIndexable(spec.colType.Type) {
 		typInfo := spec.colType.Type.DebugString()
-		panic(unimplemented.NewWithIssueDetailf(35730, typInfo,
-			"column %s is of type %s and thus is not indexable",
-			d.Name,
-			spec.colType.Type.Name()))
+		panic(sqlerrors.NewColumnNotIndexableError(d.Name.String(), spec.colType.Type.Name(), typInfo))
 	}
 	// Block unsupported types.
 	switch spec.colType.Type.Oid() {
@@ -308,22 +302,30 @@ func alterTableAddColumn(
 	}
 }
 
-func alterTableAddColumnSerial(
+func alterTableAddColumnSerialOrGeneratedIdentity(
 	b BuildCtx, d *tree.ColumnTableDef, tn *tree.TableName,
 ) (newDef *tree.ColumnTableDef, colDefaultExpression *scpb.Expression) {
 	if err := catalog.AssertValidSerialColumnDef(d, tn); err != nil {
 		panic(err)
 	}
+	// A generated column can also be serial at the same time.
+	isGeneratedColumn := !d.IsSerial && d.GeneratedIdentity.IsGeneratedAsIdentity
 
 	defType, err := tree.ResolveType(b, d.Type, b.SemaCtx().GetTypeResolver())
 	if err != nil {
 		panic(err)
 	}
-
-	telemetry.Inc(sqltelemetry.SerialColumnNormalizationCounter(
-		defType.Name(), b.SessionData().SerialNormalizationMode.String()))
+	if d.IsSerial {
+		telemetry.Inc(sqltelemetry.SerialColumnNormalizationCounter(
+			defType.Name(), b.SessionData().SerialNormalizationMode.String()))
+	}
 
 	serialNormalizationMode := b.SessionData().SerialNormalizationMode
+	// Generate identity is always a SQL sequence based column.
+	if isGeneratedColumn {
+		serialNormalizationMode = sessiondatapb.SerialUsesSQLSequences
+	}
+
 	switch serialNormalizationMode {
 	// The type will be upgraded when the columns are setup or before a
 	// sequence is created.
@@ -378,6 +380,10 @@ func alterTableAddColumnSerial(
 	seqOptions, err := catalog.SequenceOptionsFromNormalizationMode(serialNormalizationMode, b.ClusterSettings(), d, defType)
 	if err != nil {
 		panic(err)
+	}
+	// For generated identities inherit the sequence options from the AST.
+	if d.GeneratedIdentity.IsGeneratedAsIdentity {
+		seqOptions = d.GeneratedIdentity.SeqOptions
 	}
 
 	// Create the sequence and fetch the element after. The full descriptor
@@ -671,7 +677,8 @@ func addSecondaryIndexTargetsForAddColumn(
 		TableID:       tbl.TableID,
 		IndexID:       desc.ID,
 		IsUnique:      desc.Unique,
-		IsInverted:    desc.Type == descpb.IndexDescriptor_INVERTED,
+		IsInverted:    desc.Type == idxtype.INVERTED,
+		Type:          desc.Type,
 		SourceIndexID: newPrimaryIdx.IndexID,
 		IsNotVisible:  desc.NotVisible,
 		Invisibility:  desc.Invisibility,

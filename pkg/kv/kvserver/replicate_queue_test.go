@@ -204,7 +204,6 @@ func TestReplicateQueueRebalanceMultiStore(t *testing.T) {
 		spec = func(node int, store int) base.StoreSpec {
 			return base.StoreSpec{
 				Path: filepath.Join(td, fmt.Sprintf("n%ds%d", node, store)),
-				Size: base.SizeSpec{},
 			}
 		}
 		t.Cleanup(func() {
@@ -2140,7 +2139,8 @@ func iterateOverAllStores(
 // the range log where the added replica type is a LEARNER.
 func TestPromoteNonVoterInAddVoter(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
+	scope := log.Scope(t)
+	defer scope.Close(t)
 
 	// This test is slow under stress/race and can time out when upreplicating /
 	// rebalancing to ensure all stores have the same range count initially, due
@@ -2148,6 +2148,8 @@ func TestPromoteNonVoterInAddVoter(t *testing.T) {
 	skip.UnderStress(t)
 	skip.UnderDeadlock(t)
 	skip.UnderRace(t)
+
+	defer testutils.StartExecTrace(t, scope.GetDirectory()).Finish(t)
 
 	ctx := context.Background()
 

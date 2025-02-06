@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/diagutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -132,7 +131,7 @@ func TestEnsureSQLStatsAreFlushedForTelemetry(t *testing.T) {
 
 	statusServer := s.StatusServer().(serverpb.StatusServer)
 	sqlServer := s.SQLServer().(*sql.Server)
-	sqlServer.GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).MaybeFlush(ctx, srv.AppStopper())
+	sqlServer.GetSQLStatsProvider().MaybeFlush(ctx, srv.AppStopper())
 	testutils.SucceedsSoon(t, func() error {
 		// Get the diagnostic info.
 		res, err := statusServer.Diagnostics(ctx, &serverpb.DiagnosticsRequest{NodeId: "local"})
@@ -217,7 +216,7 @@ func TestSQLStatCollection(t *testing.T) {
 	sqlServer.GetSQLStatsController().ResetLocalSQLStats(ctx)
 
 	// Query the reported statistics.
-	stats, err = sqlServer.GetScrubbedReportingStats(ctx, 1000 /* limit */)
+	stats, err = sqlServer.GetScrubbedReportingStats(ctx, 1000, true)
 	require.NoError(t, err)
 
 	foundStat = false
@@ -275,7 +274,7 @@ func TestSQLStatCollection(t *testing.T) {
 	sqlServer.GetSQLStatsController().ResetLocalSQLStats(ctx)
 
 	// Find our statement stat from the reported stats pool.
-	stats, err = sqlServer.GetScrubbedReportingStats(ctx, 1000 /* limit */)
+	stats, err = sqlServer.GetScrubbedReportingStats(ctx, 1000, true)
 	require.NoError(t, err)
 
 	foundStat = false
@@ -341,7 +340,7 @@ func TestClusterResetSQLStats(t *testing.T) {
 			populateStats(t, sqlDB)
 			if flushed {
 				gateway.SQLServer().(*sql.Server).
-					GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).MaybeFlush(ctx, gateway.AppStopper())
+					GetSQLStatsProvider().MaybeFlush(ctx, gateway.AppStopper())
 			}
 
 			statsPreReset, err := status.Statements(ctx, &serverpb.StatementsRequest{
@@ -411,13 +410,13 @@ func TestScrubbedReportingStatsLimit(t *testing.T) {
 
 	// verify that with low limit, number of stats is within that limit
 	sqlServer.GetSQLStatsController().ResetLocalSQLStats(ctx)
-	stats, err := sqlServer.GetScrubbedReportingStats(ctx, 5 /* limit */)
+	stats, err := sqlServer.GetScrubbedReportingStats(ctx, 5, true)
 	require.NoError(t, err)
 	require.LessOrEqual(t, len(stats), 5)
 
 	// verify that with high limit, the number of	queries is as much as the above
 	sqlServer.GetSQLStatsController().ResetLocalSQLStats(ctx)
-	stats, err = sqlServer.GetScrubbedReportingStats(ctx, 1000 /* limit */)
+	stats, err = sqlServer.GetScrubbedReportingStats(ctx, 1000, true)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(stats), 7)
 }

@@ -330,6 +330,16 @@ type raft struct {
 
 	state pb.StateType
 
+	// idxPreLeading is the last log index as of when this node became the
+	// leader. Separates entries proposed by previous leaders from the entries
+	// proposed by the current leader. Used only in StateLeader, and updated
+	// when entering StateLeader (in becomeLeader()).
+	//
+	// Invariants (when in StateLeader at raft.Term):
+	//	- entries at indices <= idxPreLeading have term < raft.Term
+	//	- entries at indices > idxPreLeading have term == raft.Term
+	idxPreLeading uint64
+
 	// isLearner is true if the local raft node is a learner.
 	isLearner bool
 
@@ -704,7 +714,7 @@ func (r *raft) maybeSendAppend(to pb.PeerID) bool {
 
 	last, commit := r.raftLog.lastIndex(), r.raftLog.committed
 	sendEntries := pr.ShouldSendEntries(last, r.lazyReplication)
-	sendProbe := !sendEntries && pr.ShouldSendProbe(last, commit, true /* advanceCommit */)
+	sendProbe := !sendEntries && pr.ShouldSendProbe(last, commit)
 	if !sendEntries && !sendProbe {
 		return false
 	}
@@ -784,14 +794,9 @@ func (r *raft) maybeSendSnapshot(to pb.PeerID, pr *tracker.Progress) bool {
 func (r *raft) sendHeartbeat(to pb.PeerID) {
 	pr := r.trk.Progress(to)
 	r.send(pb.Message{
-		To:   to,
-		Type: pb.MsgHeartbeat,
-		// NOTE: Starting from V24_3_AdvanceCommitIndexViaMsgApps, heartbeats do not
-		// advance the commit index. Instead, MsgApp are used for that purpose.
-		// TODO(iskettaneh): Remove the commit from the heartbeat message in versions
-		// >= 25.1.
-		Commit: 0,
-		Match:  pr.Match,
+		To:    to,
+		Type:  pb.MsgHeartbeat,
+		Match: pr.Match,
 	})
 }
 
@@ -1033,9 +1038,14 @@ func (r *raft) maybeCommit() bool {
 	// replicas; once an entry from the current term has been committed in this
 	// way, then all prior entries are committed indirectly because of the Log
 	// Matching Property.
-	if !r.raftLog.matchTerm(entryID{term: r.Term, index: index}) {
+	//
+	// This comparison is equivalent in output to:
+	// if !r.raftLog.matchTerm(entryID{term: r.Term, index: index})
+	// But avoids (potentially) loading the entry term from storage.
+	if index <= r.idxPreLeading {
 		return false
 	}
+
 	r.raftLog.commitTo(LogMark{Term: r.Term, Index: index})
 	return true
 }
@@ -1174,6 +1184,7 @@ func (r *raft) tickElection() {
 	r.heartbeatElapsed++
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.heartbeatElapsed = 0
+
 		if r.shouldBcastDeFortify() {
 			r.bcastDeFortify()
 		}
@@ -1207,6 +1218,9 @@ func (r *raft) tickElection() {
 // tickHeartbeat is run by leaders to send a MsgBeat after r.heartbeatTimeout.
 func (r *raft) tickHeartbeat() {
 	assertTrue(r.state == pb.StateLeader, "tickHeartbeat called by non-leader")
+
+	// Compute the LeadSupportUntil on every tick.
+	r.fortificationTracker.ComputeLeadSupportUntil(r.state)
 
 	// Check if we intended to step down. If so, step down if it's safe to do so.
 	// Otherwise, continue doing leader things.
@@ -1360,6 +1374,11 @@ func (r *raft) becomeLeader() {
 	// pending log entries, and scanning the entire tail of the log
 	// could be expensive.
 	r.pendingConfIndex = r.raftLog.lastIndex()
+
+	// Remember the last log index before the term advances to
+	// our current (leader) term.
+	// See the idxPreLeading comment for more details.
+	r.idxPreLeading = r.raftLog.lastIndex()
 
 	emptyEnt := pb.Entry{Data: nil}
 	if !r.appendEntry(emptyEnt) {
@@ -2297,10 +2316,10 @@ func stepFollower(r *raft, m pb.Message) error {
 		// may never be safe for MsgTimeoutNow to come from anyone but the leader.
 		// We need to think about this more.
 		//
-		//if r.supportingFortifiedLeader() && r.lead != m.From {
+		// if r.supportingFortifiedLeader() && r.lead != m.From {
 		//	r.logger.Infof("%x [term %d] ignored MsgTimeoutNow from %x due to leader fortification", r.id, r.Term, m.From)
 		//	return nil
-		//}
+		// }
 		r.logger.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership", r.id, r.Term, m.From)
 		// Leadership transfers never use pre-vote even if r.preVote is true; we
 		// know we are not recovering from a partition so there is no need for the
@@ -2433,33 +2452,6 @@ func (r *raft) checkMatch(match uint64) {
 
 func (r *raft) handleHeartbeat(m pb.Message) {
 	r.checkMatch(m.Match)
-
-	// The m.Term leader is indicating to us through this heartbeat message
-	// that indices <= m.Commit in its log are committed. If our log matches
-	// the leader's up to index M, then we can update our commit index to
-	// min(m.Commit, M).
-	//
-	// If accTerm == m.Term, i.e. the last accepted log append came from this
-	// leader, then we know that our log is a prefix of the leader's log. We can
-	// thus put M = r.raftLog.lastIndex() in the formula above.
-	//
-	// Otherwise (accTerm != m.Term), we haven't accepted a single log append from
-	// the m.Term leader, so we don't know M, and it is unsafe to update the
-	// commit index.
-	//
-	// NB: in the latter case, our log is lagging the leader's. If the leader is
-	// stable, we will eventually accept a MsgApp which sets accTerm == m.Term and
-	// enables advancing the commit index. By this, we have the guarantee that our
-	// commit index converges to the leader's.
-	//
-	// TODO(pav-kv): the condition can be relaxed, it is actually safe to bump the
-	// commit index if accTerm >= m.Term.
-	// TODO(pav-kv): move this logic to raftLog.commitTo, once the accTerm has
-	// migrated to raftLog/unstable.
-	mark := LogMark{Term: m.Term, Index: min(m.Commit, r.raftLog.lastIndex())}
-	if mark.Term == r.raftLog.accTerm() {
-		r.raftLog.commitTo(mark)
-	}
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp})
 }
 
@@ -2754,6 +2746,10 @@ func (r *raft) switchToConfig(cfg quorum.Config, progressMap tracker.ProgressMap
 		//    leader is gone and stepping up to campaign.
 		r.logger.Panicf("%x leader removed from configuration %s", r.id, r.config)
 	}
+
+	// Config changes might cause the LeadSupportUntil to change, we need to
+	// recalculate it here.
+	r.fortificationTracker.ComputeLeadSupportUntil(r.state)
 
 	if r.isLearner {
 		// This node is leader and was demoted, step down.

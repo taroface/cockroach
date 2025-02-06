@@ -88,6 +88,7 @@ func TestEngineComparer(t *testing.T) {
 	ts5 := hlc.Timestamp{WallTime: 1}
 
 	syntheticBit := []byte{1}
+	var zeroLogical [mvccEncodedTimeLogicalLen]byte
 	ts2a := appendBytesToTimestamp(ts2, syntheticBit)
 	ts3a := appendBytesToTimestamp(ts3, zeroLogical[:])
 	ts3b := appendBytesToTimestamp(ts3, slices.Concat(zeroLogical[:], syntheticBit))
@@ -189,7 +190,7 @@ func TestEngineComparer(t *testing.T) {
 	for _, v := range []any{ts1, ts2, ts2a, ts3, ts3a, ts3b, ts4, ts5, lock1, lock2} {
 		suffixes = append(suffixes, encodeVersion(v))
 	}
-	require.NoError(t, pebble.CheckComparer(EngineComparer, prefixes, suffixes))
+	require.NoError(t, pebble.CheckComparer(&EngineComparer, prefixes, suffixes))
 }
 
 func TestPebbleIterReuse(t *testing.T) {
@@ -534,7 +535,7 @@ func BenchmarkMVCCKeyCompare(b *testing.B) {
 	keys := makeRandEncodedKeys()
 	b.ResetTimer()
 	for i, j := 0, 0; i < b.N; i, j = i+1, j+3 {
-		_ = EngineKeyCompare(keys[i%len(keys)], keys[j%len(keys)])
+		_ = EngineComparer.Compare(keys[i%len(keys)], keys[j%len(keys)])
 	}
 }
 
@@ -542,7 +543,7 @@ func BenchmarkMVCCKeyEqual(b *testing.B) {
 	keys := makeRandEncodedKeys()
 	b.ResetTimer()
 	for i, j := 0, 0; i < b.N; i, j = i+1, j+3 {
-		_ = EngineKeyEqual(keys[i%len(keys)], keys[j%len(keys)])
+		_ = EngineComparer.Equal(keys[i%len(keys)], keys[j%len(keys)])
 	}
 }
 
@@ -626,7 +627,7 @@ func (l *nonFatalLogger) Fatalf(format string, args ...interface{}) {
 	l.t.Logf(format, args...)
 }
 
-func TestPebbleKeyValidationFunc(t *testing.T) {
+func TestPebbleValidateKey(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// Capture fatal errors by swapping out the logger.
@@ -635,25 +636,23 @@ func TestPebbleKeyValidationFunc(t *testing.T) {
 	l := &nonFatalLogger{t: t}
 	opt := func(cfg *engineConfig) error {
 		cfg.opts.LoggerAndTracer = l
-		cfg.opts.Experimental.KeyValidationFunc = func(k []byte) error {
+		comparer := *cfg.opts.Comparer
+		comparer.ValidateKey = func(k []byte) error {
 			if bytes.Contains(k, []byte("foo")) {
 				return errors.Errorf("key contains 'foo'")
 			}
 			return nil
 		}
+		cfg.opts.Comparer = &comparer
 		return nil
 	}
 	engine := createTestPebbleEngine(opt).(*Pebble)
 	defer engine.Close()
 
 	ek := EngineKey{Key: roachpb.Key("foo")}
-
-	err := engine.PutEngineKey(ek, []byte("bar"))
-	require.NoError(t, err)
-
+	require.NoError(t, engine.PutEngineKey(ek, []byte("bar")))
 	// Force a flush to trigger the compaction error.
-	err = engine.Flush()
-	require.NoError(t, err)
+	require.NoError(t, engine.Flush())
 
 	// A fatal error was captured by the logger.
 	require.True(t, l.caught.Load().(bool))
@@ -1665,11 +1664,8 @@ func TestPebbleLoggingSlowReads(t *testing.T) {
 		dFS := delayFS{FS: memFS}
 		e, err := fs.InitEnv(context.Background(), dFS, "" /* dir */, fs.EnvConfig{}, nil /* statsCollector */)
 		require.NoError(t, err)
-		// No block cache, so all reads go to FS.
-		db, err := Open(ctx, e, cluster.MakeClusterSettings(), func(cfg *engineConfig) error {
-			cfg.cacheSize = nil
-			return nil
-		})
+		// Tiny block cache, so all reads go to FS.
+		db, err := Open(ctx, e, cluster.MakeClusterSettings(), CacheSize(1024))
 		require.NoError(t, err)
 		defer db.Close()
 		// Write some data and flush to disk.
@@ -1709,8 +1705,8 @@ func TestPebbleLoggingSlowReads(t *testing.T) {
 		slowCount := testFunc(t, "pebble_logger_and_tracer")
 		require.Equal(t, 0, slowCount)
 	})
-	t.Run("reader", func(t *testing.T) {
-		slowCount := testFunc(t, "reader")
+	t.Run("block", func(t *testing.T) {
+		slowCount := testFunc(t, "block")
 		require.Less(t, 0, slowCount)
 	})
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -913,6 +914,9 @@ func (f *ExprFmtCtx) formatRelational(e RelExpr, tp treeprinter.Node) {
 			if cost.Flags.HugeCostPenalty {
 				b.WriteString(" huge-cost-penalty")
 			}
+			if cost.Flags.UnboundedCardinality {
+				b.WriteString(" unbounded-cardinality")
+			}
 			tp.Child(b.String())
 		}
 	}
@@ -1473,10 +1477,10 @@ func (f *ExprFmtCtx) formatIndex(tabID opt.TableID, idxOrd cat.IndexOrdinal, rev
 	if reverse {
 		f.Buffer.WriteString(",rev")
 	}
-	if index.IsInverted() {
+	switch index.Type() {
+	case idxtype.INVERTED:
 		f.Buffer.WriteString(",inverted")
-	}
-	if index.IsVector() {
+	case idxtype.VECTOR:
 		f.Buffer.WriteString(",vector")
 	}
 	if _, isPartial := index.Predicate(); isPartial {
@@ -1687,6 +1691,7 @@ func (f *ExprFmtCtx) formatColSimple(label string, id opt.ColumnID) {
 func (f *ExprFmtCtx) formatColSimpleToBuffer(buf *bytes.Buffer, label string, id opt.ColumnID) {
 	if label == "" {
 		if f.Memo != nil {
+			//nolint metadata will never be locked here.
 			md := f.Memo.metadata
 			fullyQualify := !f.HasFlags(ExprFmtHideQualifications)
 			label = md.QualifiedAlias(f.Ctx, id, fullyQualify, false /* alwaysQualify */, f.Catalog)

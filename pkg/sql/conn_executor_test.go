@@ -55,8 +55,8 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
@@ -693,8 +693,12 @@ func TestPrepareInExplicitTransactionDoesNotDeadlock(t *testing.T) {
 
 	tx1, err := sqlDB.Begin()
 	require.NoError(t, err)
+	_, err = tx1.Exec("SET LOCAL autocommit_before_ddl = false")
+	require.NoError(t, err)
 
 	tx2, err := sqlDB.Begin()
+	require.NoError(t, err)
+	_, err = tx2.Exec("SET LOCAL autocommit_before_ddl = false")
 	require.NoError(t, err)
 
 	// So now I really want to try to have a deadlock.

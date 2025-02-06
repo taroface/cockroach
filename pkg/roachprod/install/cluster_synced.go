@@ -369,16 +369,38 @@ if ! %s; then
 `, isValidHost, errMsg, elseBranch)
 }
 
-// validateHost will run `validateHostnameCmd` on the node passed to
+// validateHost will run `validateHostnameCmd` on the node(s) passed to
 // make sure it still belongs to the SyncedCluster. Returns an error
 // when the hostnames don't match, indicating that the roachprod cache
 // is stale.
-func (c *SyncedCluster) validateHost(ctx context.Context, l *logger.Logger, node Node) error {
+func (c *SyncedCluster) validateHost(ctx context.Context, l *logger.Logger, nodes Nodes) error {
 	if c.IsLocal() {
 		return nil
 	}
-	cmd := c.validateHostnameCmd("", node)
-	return c.Run(ctx, l, l.Stdout, l.Stderr, WithNodes(Nodes{node}), "validate-ssh-host", cmd)
+
+	// Retry on different nodes, in case some of the VMs are unreachable.
+	// While this does indicate something is likely wrong, we don't want to
+	// fail here as some callers want to tolerate this, e.g. fetching logs
+	// after a test failure shouldn't fail just because one VM is down.
+	var combinedErr error
+	retryOpts := *DefaultRetryOpt
+	retryOpts.MaxRetries = 4
+	r := retry.StartWithCtx(ctx, retryOpts)
+	for nodeIdx := 0; r.Next(); nodeIdx = (nodeIdx + 1) % len(nodes) {
+		node := nodes[nodeIdx]
+		cmd := c.validateHostnameCmd("", node)
+
+		err := c.Run(ctx, l, l.Stdout, l.Stderr, WithNodes(Nodes{node}).WithRetryDisabled(), "validate-ssh-host", cmd)
+		if err != nil {
+			if !rperrors.IsTransient(err) {
+				return err
+			}
+			combinedErr = errors.CombineErrors(combinedErr, err)
+			continue
+		}
+		return nil
+	}
+	return combinedErr
 }
 
 // cmdDebugName is the suffix of the generated ssh debug file
@@ -593,22 +615,27 @@ func (c *SyncedCluster) Wipe(ctx context.Context, l *logger.Logger, preserveCert
 	if err := c.Stop(ctx, l, int(unix.SIGKILL), true /* wait */, 0 /* gracePeriod */, ""); err != nil {
 		return err
 	}
-	return c.Parallel(ctx, l, WithNodes(c.Nodes).WithDisplay(display), func(ctx context.Context, node Node) (*RunResultDetails, error) {
+	err := c.Parallel(ctx, l, WithNodes(c.Nodes).WithDisplay(display), func(ctx context.Context, node Node) (*RunResultDetails, error) {
 		var cmd string
 		if c.IsLocal() {
 			// Not all shells like brace expansion, so we'll do it here
-			dirs := []string{"data*", "logs*"}
-			if !preserveCerts {
-				dirs = append(dirs, fmt.Sprintf("%s*", CockroachNodeCertsDir))
-				dirs = append(dirs, fmt.Sprintf("%s*", CockroachNodeTenantCertsDir))
+			paths := []string{
+				"data*",
+				"logs*",
+				"cockroach-*.sh",
 			}
-			for _, dir := range dirs {
+			if !preserveCerts {
+				paths = append(paths, fmt.Sprintf("%s*", CockroachNodeCertsDir))
+				paths = append(paths, fmt.Sprintf("%s*", CockroachNodeTenantCertsDir))
+			}
+			for _, dir := range paths {
 				cmd += fmt.Sprintf(`rm -fr %s/%s ;`, c.localVMDir(node), dir)
 			}
 		} else {
 			rmCmds := []string{
 				fmt.Sprintf(`sudo find /mnt/data* -maxdepth 1 -type f -not -name %s -exec rm -f {} \;`, vm.InitializedFile),
 				`sudo rm -fr /mnt/data*/{auxiliary,local,tmp,cassandra,cockroach,cockroach-temp*,mongo-data}`,
+				`sudo rm -fr cockroach-*.sh`,
 				`sudo rm -fr logs* data*`,
 			}
 			if !preserveCerts {
@@ -622,6 +649,16 @@ func (c *SyncedCluster) Wipe(ctx context.Context, l *logger.Logger, preserveCert
 		}
 		return c.runCmdOnSingleNode(ctx, l, node, cmd, defaultCmdOpts("wipe"))
 	})
+	if err != nil {
+		return err
+	}
+
+	err = c.Cluster.DeletePrometheusConfig(ctx, l)
+	if err != nil {
+		l.Printf("WARNING: failed to delete the prometheus config (already wiped?): %s", err)
+	}
+
+	return nil
 }
 
 // NodeStatus contains details about the status of a node.
@@ -1641,7 +1678,7 @@ func (c *SyncedCluster) PutString(
 func (c *SyncedCluster) Put(
 	ctx context.Context, l *logger.Logger, nodes Nodes, src string, dest string,
 ) error {
-	if err := c.validateHost(ctx, l, nodes[0]); err != nil {
+	if err := c.validateHost(ctx, l, nodes); err != nil {
 		return err
 	}
 	// Check if source file exists and if it's a symlink.
@@ -1885,7 +1922,7 @@ func (c *SyncedCluster) Logs(
 	from, to time.Time,
 	out io.Writer,
 ) error {
-	if err := c.validateHost(context.TODO(), l, c.Nodes[0]); err != nil {
+	if err := c.validateHost(context.TODO(), l, c.Nodes); err != nil {
 		return err
 	}
 	rsyncNodeLogs := func(ctx context.Context, node Node) error {
@@ -2013,7 +2050,7 @@ func (c *SyncedCluster) Logs(
 func (c *SyncedCluster) Get(
 	ctx context.Context, l *logger.Logger, nodes Nodes, src, dest string,
 ) error {
-	if err := c.validateHost(context.TODO(), l, nodes[0]); err != nil {
+	if err := c.validateHost(ctx, l, nodes); err != nil {
 		return err
 	}
 	// TODO(peter): Only get 10 nodes at a time. When a node completes, output a
@@ -2281,7 +2318,7 @@ func (c *SyncedCluster) loadBalancerURL(
 // exclusively.
 func (c *SyncedCluster) SSH(ctx context.Context, l *logger.Logger, sshArgs, args []string) error {
 	targetNode := c.Nodes[0]
-	if err := c.validateHost(ctx, l, targetNode); err != nil {
+	if err := c.validateHost(ctx, l, Nodes{targetNode}); err != nil {
 		return err
 	}
 

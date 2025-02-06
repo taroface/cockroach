@@ -959,9 +959,28 @@ func validateSink(
 	if err != nil {
 		return err
 	}
+	sinkTy := canarySink.getConcreteType()
 	if err := canarySink.Close(); err != nil {
 		return err
 	}
+
+	// envelope=enriched is only allowed for non-query feeds and certain sinks.
+	if details.Opts[changefeedbase.OptEnvelope] == string(changefeedbase.OptEnvelopeEnriched) {
+		if details.Select != `` {
+			return errors.Newf("envelope=%s is incompatible with SELECT statement", changefeedbase.OptEnvelopeEnriched)
+		}
+		allowedSinkTypes := map[sinkType]struct{}{
+			sinkTypeNull:           {},
+			sinkTypePubsub:         {},
+			sinkTypeKafka:          {},
+			sinkTypeWebhook:        {},
+			sinkTypeSinklessBuffer: {},
+		}
+		if _, ok := allowedSinkTypes[sinkTy]; !ok {
+			return errors.Newf("envelope=%s is incompatible with %s sink", changefeedbase.OptEnvelopeEnriched, sinkTy)
+		}
+	}
+
 	// If there's no projection we may need to force some options to ensure messages
 	// have enough information.
 	if details.Select == `` {
@@ -1499,12 +1518,17 @@ func reconcileJobStateWithLocalState(
 		}
 	}
 
-	maxBytes := changefeedbase.FrontierCheckpointMaxBytes.Get(&execCfg.Settings.SV)
-	checkpoint := checkpoint.Make(sf.Frontier(), func(forEachSpan span.Operation) {
-		for _, fs := range localState.aggregatorFrontier {
-			forEachSpan(fs.Span, fs.Timestamp)
-		}
-	}, maxBytes)
+	maxBytes := changefeedbase.SpanCheckpointMaxBytes.Get(&execCfg.Settings.SV)
+	checkpoint := checkpoint.Make(
+		sf.Frontier(),
+		func(forEachSpan span.Operation) {
+			for _, fs := range localState.aggregatorFrontier {
+				forEachSpan(fs.Span, fs.Timestamp)
+			}
+		},
+		maxBytes,
+		nil, /* metrics */
+	)
 
 	// Update checkpoint.
 	updateHW := highWater.Less(sf.Frontier())

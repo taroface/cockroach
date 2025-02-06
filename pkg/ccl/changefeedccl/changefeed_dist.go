@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/kvccl/kvfollowerreadsccl"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -149,7 +150,7 @@ func fetchTableDescriptors(
 	) error {
 		targetDescs = make([]catalog.TableDescriptor, 0, targets.NumUniqueTables())
 		if err := txn.KV().SetFixedTimestamp(ctx, ts); err != nil {
-			return err
+			return errors.Wrapf(err, "setting timestamp for table descriptor fetch")
 		}
 		// Note that all targets are currently guaranteed to have a Table ID
 		// and lie within the primary index span. Deduplication is important
@@ -157,7 +158,7 @@ func fetchTableDescriptors(
 		return targets.EachTableID(func(id catid.DescID) error {
 			tableDesc, err := descriptors.ByIDWithoutLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, id)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "fetching table descriptor %d", id)
 			}
 			targetDescs = append(targetDescs, tableDesc)
 			return nil
@@ -257,6 +258,7 @@ func startDistChangefeed(
 	dsp := execCtx.DistSQLPlanner()
 	evalCtx := execCtx.ExtendedEvalContext()
 
+	//lint:ignore SA1019 deprecated usage
 	var checkpoint *jobspb.ChangefeedProgress_Checkpoint
 	if progress := localState.progress.GetChangefeed(); progress != nil && progress.Checkpoint != nil {
 		checkpoint = progress.Checkpoint
@@ -378,6 +380,7 @@ func makePlan(
 	description string,
 	initialHighWater hlc.Timestamp,
 	trackedSpans []roachpb.Span,
+	//lint:ignore SA1019 deprecated usage
 	checkpoint *jobspb.ChangefeedProgress_Checkpoint,
 	drainingNodes []roachpb.NodeID,
 ) func(context.Context, *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
@@ -467,25 +470,45 @@ func makePlan(
 				log.Infof(ctx, "watched spans for node %d: %v", sp.SQLInstanceID, sp)
 			}
 			watches := make([]execinfrapb.ChangeAggregatorSpec_Watch, len(sp.Spans))
+
+			var initialHighWaterPtr *hlc.Timestamp
 			for watchIdx, nodeSpan := range sp.Spans {
-				initialResolved := initialHighWater
-				if checkpointSpanGroup.Encloses(nodeSpan) {
-					initialResolved = checkpoint.Timestamp
-				}
-				watches[watchIdx] = execinfrapb.ChangeAggregatorSpec_Watch{
-					Span:            nodeSpan,
-					InitialResolved: initialResolved,
+				if evalCtx.Settings.Version.IsActive(ctx, clusterversion.V25_2) {
+					// If the cluster has been fully upgraded to v25.2, we should populate
+					// the initial highwater of ChangeAggregatorSpec_Watch and leave the
+					// initial resolved of each span empty. We rely on the aggregators to
+					// forward the checkpointed timestamp for every span based on
+					// aggregatorCheckpoint.
+					watches[watchIdx] = execinfrapb.ChangeAggregatorSpec_Watch{
+						Span: nodeSpan,
+					}
+					initialHighWaterPtr = &initialHighWater
+				} else {
+					// If the cluster has not been fully upgraded to v25.2, we should
+					// leave the initial highwater of ChangeAggregatorSpec_Watch as nil.
+					// We rely on this to tell the aggregators to the initial resolved
+					// timestamp for each span to infer the initial highwater. Read more
+					// from changeAggregator.getInitialHighWaterAndSpans.
+					initialResolved := initialHighWater
+					if checkpointSpanGroup.Encloses(nodeSpan) {
+						initialResolved = checkpoint.Timestamp
+					}
+					watches[watchIdx] = execinfrapb.ChangeAggregatorSpec_Watch{
+						Span:            nodeSpan,
+						InitialResolved: initialResolved,
+					}
 				}
 			}
 
 			aggregatorSpecs[i] = &execinfrapb.ChangeAggregatorSpec{
-				Watches:     watches,
-				Checkpoint:  aggregatorCheckpoint,
-				Feed:        details,
-				UserProto:   execCtx.User().EncodeProto(),
-				JobID:       jobID,
-				Select:      execinfrapb.Expression{Expr: details.Select},
-				Description: description,
+				InitialHighWater: initialHighWaterPtr,
+				Watches:          watches,
+				Checkpoint:       aggregatorCheckpoint,
+				Feed:             details,
+				UserProto:        execCtx.User().EncodeProto(),
+				JobID:            jobID,
+				Select:           execinfrapb.Expression{Expr: details.Select},
+				Description:      description,
 			}
 		}
 

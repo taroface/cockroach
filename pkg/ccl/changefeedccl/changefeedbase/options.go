@@ -149,6 +149,7 @@ const (
 	OptEnvelopeDeprecatedRow EnvelopeType = `deprecated_row`
 	OptEnvelopeWrapped       EnvelopeType = `wrapped`
 	OptEnvelopeBare          EnvelopeType = `bare`
+	OptEnvelopeEnriched      EnvelopeType = `enriched`
 
 	OptFormatJSON    FormatType = `json`
 	OptFormatAvro    FormatType = `avro`
@@ -221,6 +222,12 @@ const (
 	SinkParamSASLAwsIAMSessionName  = `sasl_aws_iam_session_name`
 	SinkParamTableNameAttribute     = `with_table_name_attribute`
 
+	// These are custom fields required for proprietary oauth. They should not
+	// be documented.
+	SinkParamSASLProprietaryResource            = `sasl_proprietary_resource`
+	SinkParamSASLProprietaryClientAssertionType = `sasl_proprietary_client_assertion_type`
+	SinkParamSASLProprietaryClientAssertion     = `sasl_proprietary_client_assertion`
+
 	SinkSchemeConfluentKafka    = `confluent-cloud`
 	SinkParamConfluentAPIKey    = `api_key`
 	SinkParamConfluentAPISecret = `api_secret`
@@ -238,9 +245,6 @@ const (
 	// Hence, this option is not available to users
 	Topics = `topics`
 )
-
-// Support additional mechanism on top of the default SASL mechanism.
-const SASLTypeAWSMSKIAM = "AWS_MSK_IAM"
 
 func makeStringSet(opts ...string) map[string]struct{} {
 	res := make(map[string]struct{}, len(opts))
@@ -339,7 +343,7 @@ var ChangefeedOptionExpectValues = map[string]OptionPermittedValues{
 	OptCursor:                             timestampOption,
 	OptCustomKeyColumn:                    stringOption,
 	OptEndTime:                            timestampOption,
-	OptEnvelope:                           enum("row", "key_only", "wrapped", "deprecated_row", "bare"),
+	OptEnvelope:                           enum("row", "key_only", "wrapped", "deprecated_row", "bare", "enriched"),
 	OptFormat:                             enum("json", "avro", "csv", "experimental_avro", "parquet"),
 	OptFullTableName:                      flagOption,
 	OptKeyInValue:                         flagOption,
@@ -845,6 +849,10 @@ func (e EncodingOptions) Validate() error {
 	if e.Format != OptFormatJSON && e.EncodeJSONValueNullAsObject {
 		return errors.Errorf(`%s is only usable with %s=%s`, OptEncodeJSONValueNullAsObject, OptFormat, OptFormatJSON)
 	}
+	if e.Envelope == OptEnvelopeEnriched && !(e.Format == OptFormatJSON || e.Format == OptFormatAvro) {
+		return errors.Errorf(`%s=%s is only usable with %s=%s/%s`, OptEnvelope, OptEnvelopeEnriched, OptFormat, OptFormatJSON, OptFormatAvro)
+	}
+
 	if e.Envelope != OptEnvelopeWrapped && e.Format != OptFormatJSON && e.Format != OptFormatParquet {
 		requiresWrap := []struct {
 			k string

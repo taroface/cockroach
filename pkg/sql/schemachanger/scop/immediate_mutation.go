@@ -608,6 +608,41 @@ type SetPolicyName struct {
 	Name     string
 }
 
+// AddPolicyRole adds a new role to a policy.
+type AddPolicyRole struct {
+	immediateMutationOp
+	Role scpb.PolicyRole
+}
+
+// RemovePolicyRole removes an existing role from a policy.
+type RemovePolicyRole struct {
+	immediateMutationOp
+	Role scpb.PolicyRole
+}
+
+// SetPolicyUsingExpression will set a new USING expression for a policy.
+type SetPolicyUsingExpression struct {
+	immediateMutationOp
+	TableID  descpb.ID
+	PolicyID descpb.PolicyID
+	Expr     string
+}
+
+// SetPolicyWithCheckExpression will set a new WITH CHECK expression for a policy.
+type SetPolicyWithCheckExpression struct {
+	immediateMutationOp
+	TableID  descpb.ID
+	PolicyID descpb.PolicyID
+	Expr     string
+}
+
+// SetPolicyForwardReferences sets new forward references to relations, types,
+// and routines for the expressions in a policy.
+type SetPolicyForwardReferences struct {
+	immediateMutationOp
+	Deps scpb.PolicyDeps
+}
+
 // UpdateTableBackReferencesInTypes updates back references to a table
 // in the specified types.
 type UpdateTableBackReferencesInTypes struct {
@@ -710,6 +745,24 @@ type RemoveTriggerBackReferencesInRoutines struct {
 	BackReferencedTableID   descpb.ID
 	BackReferencedTriggerID descpb.TriggerID
 	RoutineIDs              []descpb.ID
+}
+
+// AddPolicyBackReferenceInFunctions adds back references to a policy from
+// referenced functions.
+type AddPolicyBackReferenceInFunctions struct {
+	immediateMutationOp
+	BackReferencedTableID  descpb.ID
+	BackReferencedPolicyID descpb.PolicyID
+	FunctionIDs            []descpb.ID
+}
+
+// RemovePolicyBackReferenceInFunctions removes back-references to a policy
+// from referenced functions.
+type RemovePolicyBackReferenceInFunctions struct {
+	immediateMutationOp
+	BackReferencedTableID  descpb.ID
+	BackReferencedPolicyID descpb.PolicyID
+	FunctionIDs            []descpb.ID
 }
 
 // SetColumnName renames a column.
@@ -1078,4 +1131,18 @@ type AddPartitionZoneConfig struct {
 	Subzone              zonepb.Subzone
 	SubzoneSpans         []zonepb.SubzoneSpan
 	SubzoneIndexToDelete int32
+}
+
+// EnableRowLevelSecurityMode sets the row-level security mode on a table.
+type EnableRowLevelSecurityMode struct {
+	immediateMutationOp
+	TableID descpb.ID
+	Enabled bool
+}
+
+// ForcedRowLevelSecurityMode configures the force setting of row-level security on a table.
+type ForcedRowLevelSecurityMode struct {
+	immediateMutationOp
+	TableID descpb.ID
+	Forced  bool
 }

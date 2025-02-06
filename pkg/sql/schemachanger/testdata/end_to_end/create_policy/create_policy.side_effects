@@ -5,13 +5,14 @@ CREATE TABLE t1 (tenant_id uuid, c1 int);
 +object {100 101 t1} -> 104
 
 /* test */
-CREATE POLICY "policy 1" on t1 AS PERMISSIVE FOR SELECT TO PUBLIC USING (tenant_id = '01538898-f55c-44db-a306-89078e2c430e');
+CREATE POLICY "policy 1" on t1 AS PERMISSIVE FOR SELECT USING (tenant_id = '01538898-f55c-44db-a306-89078e2c430e');
 ----
 begin transaction #1
 # begin StatementPhase
 checking for feature: CREATE POLICY
 increment telemetry for sql.schema.create_policy
-## StatementPhase stage 1 of 1 with 2 MutationType ops
+checking role/user "public" exists
+## StatementPhase stage 1 of 1 with 5 MutationType ops
 upsert descriptor #104
   ...
      nextIndexId: 2
@@ -19,8 +20,13 @@ upsert descriptor #104
   +  nextPolicyId: 2
      parentId: 100
   +  policies:
-  +  - id: 1
+  +  - command: SELECT
+  +    id: 1
   +    name: policy 1
+  +    roleNames:
+  +    - public
+  +    type: PERMISSIVE
+  +    usingExpr: tenant_id = '01538898-f55c-44db-a306-89078e2c430e':::UUID
      primaryIndex:
        constraintId: 1
   ...
@@ -33,7 +39,7 @@ upsert descriptor #104
 ## PreCommitPhase stage 1 of 2 with 1 MutationType op
 undo all catalog changes within txn #1
 persist all catalog changes to storage
-## PreCommitPhase stage 2 of 2 with 2 MutationType ops
+## PreCommitPhase stage 2 of 2 with 5 MutationType ops
 upsert descriptor #104
   ...
      nextIndexId: 2
@@ -41,8 +47,13 @@ upsert descriptor #104
   +  nextPolicyId: 2
      parentId: 100
   +  policies:
-  +  - id: 1
+  +  - command: SELECT
+  +    id: 1
   +    name: policy 1
+  +    roleNames:
+  +    - public
+  +    type: PERMISSIVE
+  +    usingExpr: tenant_id = '01538898-f55c-44db-a306-89078e2c430e':::UUID
      primaryIndex:
        constraintId: 1
   ...

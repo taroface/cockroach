@@ -17,9 +17,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/semenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -171,8 +173,9 @@ type Index interface {
 	IsCreatedExplicitly() bool
 	GetInvisibility() float64
 	GetPredicate() string
-	GetType() descpb.IndexDescriptor_Type
+	GetType() idxtype.T
 	GetGeoConfig() geopb.Config
+	GetVecConfig() vecpb.Config
 	GetVersion() descpb.IndexDescriptorVersion
 	GetEncodingType() catenumpb.IndexDescriptorEncodingType
 
@@ -221,6 +224,18 @@ type Index interface {
 	// InvertedColumnKind returns the kind of the inverted column of the inverted
 	// index.
 	InvertedColumnKind() catpb.InvertedIndexColumnKind
+
+	// VectorColumnName returns the name of the vector column of the vector
+	// index.
+	//
+	// Panics if the index is not a vector index.
+	VectorColumnName() string
+
+	// VectorColumnID returns the ColumnID of the vector column of the vector
+	// index.
+	//
+	// Panics if the index is not a vector index.
+	VectorColumnID() descpb.ColumnID
 
 	NumPrimaryStoredColumns() int
 	NumSecondaryStoredColumns() int

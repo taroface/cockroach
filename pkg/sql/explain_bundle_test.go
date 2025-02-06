@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/pgtest"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -222,6 +223,7 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 			{"testing_optimizer_random_seed", "123"},
 			{"timezone", "+8"},
 			{"unconstrained_non_covering_index_scan_enabled", "on"},
+			{"default_transaction_isolation", "'read committed'"},
 		}
 		for _, tc := range testcases {
 			t.Run(tc.sessionVar, func(t *testing.T) {
@@ -234,6 +236,9 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 							reg := regexp.MustCompile(fmt.Sprintf("SET %s.*-- default value", tc.sessionVar))
 							if reg.FindString(contents) == "" {
 								return errors.Errorf("could not find 'SET %s' in env.sql", tc.sessionVar)
+							}
+							if _, err := parser.Parse(contents); err != nil {
+								return errors.Wrap(err, "could not parse env.sql")
 							}
 						}
 						return nil
@@ -442,15 +447,15 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		checkBundle(
 			t, fmt.Sprint(rows), "s.foo", func(name, contents string) error {
 				if name == "schema.sql" {
-					reg := regexp.MustCompile("s.foo")
+					reg := regexp.MustCompile(`s\.foo`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for 's.foo' function in schema.sql")
 					}
-					reg = regexp.MustCompile("^foo")
+					reg = regexp.MustCompile(`^CREATE FUNCTION public\.foo`)
 					if reg.FindString(contents) != "" {
 						return errors.Errorf("found irrelevant function 'foo' in schema.sql")
 					}
-					reg = regexp.MustCompile("s.a")
+					reg = regexp.MustCompile(`s\.a`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for relation 's.a' in schema.sql")
 					}
@@ -473,15 +478,15 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		checkBundle(
 			t, fmt.Sprint(rows), "s.bar", func(name, contents string) error {
 				if name == "schema.sql" {
-					reg := regexp.MustCompile("s.bar")
+					reg := regexp.MustCompile(`s\.bar`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for 's.bar' procedure in schema.sql")
 					}
-					reg = regexp.MustCompile("^bar")
+					reg = regexp.MustCompile(`^CREATE PROCEDURE public\.bar`)
 					if reg.FindString(contents) != "" {
 						return errors.Errorf("Found irrelevant procedure 'bar' in schema.sql")
 					}
-					reg = regexp.MustCompile("s.a")
+					reg = regexp.MustCompile(`s\.a`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for relation 's.a' in schema.sql")
 					}
@@ -592,6 +597,7 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 
 	t.Run("plan-gist matching", func(t *testing.T) {
 		r.Exec(t, "CREATE TABLE gist (k INT PRIMARY KEY);")
+		r.Exec(t, "INSERT INTO gist SELECT generate_series(1, 10)")
 		const fprint = `SELECT * FROM gist`
 
 		// Come up with a target gist.
@@ -605,20 +611,20 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 				if name != "plan.txt" {
 					return nil
 				}
-				// Add a new line at the beginning for cleaner formatting in the
-				// test.
-				contents = "\n" + contents
-				// The gist appears to be somewhat non-deterministic (but its
-				// decoding stays the same), so we populate the expected
-				// contents based on the particular gist.
-				expected := fmt.Sprintf(`
--- plan is incomplete due to gist matching: %s
-
-• scan
-  table: gist@gist_pkey
-  spans: FULL SCAN`, gist)
-				if contents != expected {
-					return errors.Newf("unexpected contents of plan.txn\nexpected:\n%s\ngot:\n%s", expected, contents)
+				// We don't hard-code the full expected output here so that it
+				// doesn't need an update every time we change EXPLAIN ANALYZE
+				// output format. Instead, we only assert that a few lines are
+				// present in the output.
+				for _, expectedLine := range []string{
+					"• scan",
+					"  sql nodes: n1",
+					"  actual row count: 10",
+					"  table: gist@gist_pkey",
+					"  spans: FULL SCAN",
+				} {
+					if !strings.Contains(contents, expectedLine) {
+						return errors.Newf("didn't find %q in the output: %v", expectedLine, contents)
+					}
 				}
 				return nil
 			}, false, /* expectErrors */

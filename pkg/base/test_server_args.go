@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/storage/storagepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -89,12 +90,13 @@ type TestServerArgs struct {
 	// If not initialized, will default to DefaultTestTempStorageConfig.
 	TempStorageConfig TempStorageConfig
 
-	// ExternalIODir is used to initialize field in cluster.Settings.
-	ExternalIODir string
-
 	// ExternalIODirConfig is used to initialize the same-named
 	// field on the server.Config struct.
 	ExternalIODirConfig ExternalIODirConfig
+
+	// ExternalIODir is used to initialize the same-named field on
+	// the server.Config struct.
+	ExternalIODir string
 
 	// Fields copied to the server.Config.
 	Insecure                    bool
@@ -156,6 +158,11 @@ type TestServerArgs struct {
 	// DefaultTestTenantOptions and its various instances defined
 	// below for alternative options that suits your test case.
 	DefaultTestTenant DefaultTestTenantOptions
+
+	// DefaultTenantName is the name of the tenant created implicitly according
+	// to DefaultTestTenant. It is typically `test-tenant` for unit tests and
+	// always `demoapp` for the cockroach demo.
+	DefaultTenantName roachpb.TenantName
 
 	// StartDiagnosticsReporting checks cluster.TelemetryOptOut(), and
 	// if not disabled starts the asynchronous goroutine that checks for
@@ -484,8 +491,8 @@ var (
 	// with no special attributes.
 	DefaultTestStoreSpec = StoreSpec{
 		InMemory: true,
-		Size: SizeSpec{
-			InBytes: 512 << 20,
+		Size: storagepb.SizeSpec{
+			Capacity: 512 << 20,
 		},
 	}
 )
@@ -578,7 +585,7 @@ type TestTenantArgs struct {
 	ExternalIODirConfig ExternalIODirConfig
 
 	// ExternalIODir is used to initialize the same-named field on
-	// the params.Settings struct.
+	// the server.Config struct.
 	ExternalIODir string
 
 	// If set, this will be appended to the Postgres URL by functions that

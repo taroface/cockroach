@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -367,7 +368,7 @@ func (og *operationGenerator) addUniqueConstraint(ctx context.Context, tx pgx.Tx
 	if err != nil {
 		return nil, err
 	}
-	constraintExists, err := og.constraintExists(ctx, tx, constraintName)
+	constraintExists, err := og.constraintExists(ctx, tx, tableName.ObjectName, tree.Name(constraintName))
 	if err != nil {
 		return nil, err
 	}
@@ -890,7 +891,7 @@ func (og *operationGenerator) addForeignKeyConstraint(
 	if err != nil {
 		return nil, err
 	}
-	constraintExists, err := og.constraintExists(ctx, tx, string(constraintName))
+	constraintExists, err := og.constraintExists(ctx, tx, childTable.ObjectName, constraintName)
 	if err != nil {
 		return nil, err
 	}
@@ -982,13 +983,20 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 		}
 	}
 
+	// TODO(andyk): Do we need to include vector indexes?
+	indexType := idxtype.FORWARD
+	if og.randIntn(10) == 0 {
+		// 10% INVERTED
+		indexType = idxtype.INVERTED
+	}
+
 	def := &tree.CreateIndex{
 		Name:         tree.Name(indexName),
 		Table:        *tableName,
-		Unique:       og.randIntn(4) == 0,  // 25% UNIQUE
-		Inverted:     og.randIntn(10) == 0, // 10% INVERTED
-		IfNotExists:  og.randIntn(2) == 0,  // 50% IF NOT EXISTS
-		Invisibility: invisibility,         // 5% NOT VISIBLE
+		Unique:       og.randIntn(4) == 0, // 25% UNIQUE
+		Type:         indexType,
+		IfNotExists:  og.randIntn(2) == 0, // 50% IF NOT EXISTS
+		Invisibility: invisibility,        // 5% NOT VISIBLE
 	}
 
 	regionColumn := tree.Name("")
@@ -1020,7 +1028,7 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 		if columnNames[i].name == regionColumn && i != 0 {
 			duplicateRegionColumn = true
 		}
-		if def.Inverted {
+		if def.Type == idxtype.INVERTED {
 			// We can have an inverted index on a set of columns if the last column
 			// is an inverted indexable type and the preceding columns are not.
 			invertedIndexableType := colinfo.ColumnTypeIsInvertedIndexable(columnNames[i].typ)
@@ -1137,10 +1145,10 @@ func (og *operationGenerator) createIndex(ctx context.Context, tx pgx.Tx) (*opSt
 		stmt.expectedExecErrors.addAll(codesWithConditions{
 			{code: pgcode.DuplicateRelation, condition: indexExists},
 			// Inverted indexes do not support stored columns.
-			{code: pgcode.InvalidSQLStatementName, condition: len(def.Storing) > 0 && def.Inverted},
+			{code: pgcode.InvalidSQLStatementName, condition: len(def.Storing) > 0 && def.Type == idxtype.INVERTED},
 			// Inverted indexes cannot be unique.
-			{code: pgcode.InvalidSQLStatementName, condition: def.Unique && def.Inverted},
-			{code: pgcode.InvalidSQLStatementName, condition: def.Inverted && len(def.Storing) > 0},
+			{code: pgcode.InvalidSQLStatementName, condition: def.Unique && def.Type == idxtype.INVERTED},
+			{code: pgcode.InvalidSQLStatementName, condition: def.Type == idxtype.INVERTED && len(def.Storing) > 0},
 			{code: pgcode.DuplicateColumn, condition: duplicateStore},
 			{code: pgcode.FeatureNotSupported, condition: nonIndexableType},
 			{code: pgcode.FeatureNotSupported, condition: regionColStored},
@@ -2935,7 +2943,23 @@ func (og *operationGenerator) insertRow(ctx context.Context, tx pgx.Tx) (stmt *o
 	for i := 0; i < numRows; i++ {
 		var row []string
 		for _, col := range nonGeneratedCols {
-			d := randgen.RandDatum(og.params.rng, col.typ, col.nullable)
+			// Limit the size of columns being generated.
+			const maxSize = 1024 * 1024
+			maxAttempts := 32
+			var d tree.Datum
+			for i := 0; i < maxAttempts; i++ {
+				d = randgen.RandDatum(og.params.rng, col.typ, col.nullable)
+				// Retry if we exceed the maximum size.
+				if d.Size() < maxSize {
+					break
+				}
+			}
+			if d.Size() > maxSize {
+				og.LogMessage(fmt.Sprintf("datum of type %s exceeds size limit (%d / %d)",
+					col.typ.SQLString(),
+					d.Size(),
+					maxSize))
+			}
 			// Unfortunately, RandDatum for OIDs only selects random values, which will
 			// always fail validation. So, for OIDs we will select a random known type
 			// instead.

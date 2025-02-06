@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
@@ -50,6 +52,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestPCRPrivs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	args := replicationtestutils.DefaultTenantStreamingClustersArgs
+	c, cleanup := replicationtestutils.CreateTenantStreamingClusters(ctx, t, args)
+	defer cleanup()
+
+	c.DestSysSQL.Exec(t, fmt.Sprintf("CREATE USER %s", username.TestUser))
+	c.SrcSysSQL.Exec(t, fmt.Sprintf("CREATE USER %s", username.TestUser+"2"))
+	testuser := sqlutils.MakeSQLRunner(c.DestSysServer.SQLConn(t, serverutils.User(username.TestUser)))
+	srcURL, cleanupSinkCert := sqlutils.PGUrl(t, c.SrcSysServer.AdvSQLAddr(), t.Name(), url.User(username.TestUser+"2"))
+	defer cleanupSinkCert()
+
+	streamReplStmt := fmt.Sprintf("CREATE TENANT %s FROM REPLICATION OF %s ON '%s'",
+		c.Args.DestTenantName,
+		c.Args.SrcTenantName,
+		srcURL.String())
+
+	testuser.ExpectErr(t, "user testuser does not have MANAGEVIRTUALCLUSTER system privilege", streamReplStmt)
+
+	c.DestSysSQL.Exec(t, fmt.Sprintf("GRANT SYSTEM MANAGEVIRTUALCLUSTER TO %s", username.TestUser))
+	testuser.ExpectErr(t, "user testuser2 does not have REPLICATION system privilege", streamReplStmt)
+
+	c.SrcSysSQL.Exec(t, fmt.Sprintf("GRANT SYSTEM REPLICATION TO %s", username.TestUser+"2"))
+	c.DestSysSQL.Exec(t, streamReplStmt)
+
+}
 func TestTenantStreamingProducerJobTimedOut(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -643,7 +674,7 @@ func TestTenantStreamingDeleteRange(t *testing.T) {
 				storageutils.RangeKV(string(tableSpan.Key), string(tableSpan.EndKey), int(batchHLCTime.WallTime), ""),
 			})
 			_, _, _, err := c.SrcSysServer.DB().AddSSTableAtBatchTimestamp(ctx, start, end, data, false,
-				false, hlc.Timestamp{}, nil, false, batchHLCTime)
+				hlc.Timestamp{}, nil, false, batchHLCTime)
 			require.NoError(t, err)
 		} else {
 			// Use DelRange directly.
@@ -665,76 +696,6 @@ func TestTenantStreamingDeleteRange(t *testing.T) {
 	// can work on multiple flushes.
 	checkDelRangeOnTable("t1", true /* embeddedInSST */)
 	checkDelRangeOnTable("t2", false /* embeddedInSST */)
-}
-
-func TestTenantStreamingMultipleNodes(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	skip.UnderDeadlock(t, "multi-node may time out under deadlock")
-	skip.UnderRace(t, "multi-node test may time out under race")
-
-	ctx := context.Background()
-
-	testutils.RunTrueAndFalse(t, "fromSystem", func(t *testing.T, sys bool) {
-		args := replicationtestutils.DefaultTenantStreamingClustersArgs
-		args.MultitenantSingleClusterNumNodes = 3
-
-		// Track the number of unique addresses that were connected to
-		clientAddresses := make(map[string]struct{})
-		var addressesMu syncutil.Mutex
-		args.TestingKnobs = &sql.StreamingTestingKnobs{
-			BeforeClientSubscribe: func(addr string, token string, _ span.Frontier, _ bool) {
-				addressesMu.Lock()
-				defer addressesMu.Unlock()
-				clientAddresses[addr] = struct{}{}
-			},
-		}
-
-		if sys {
-			args.SrcTenantID = roachpb.SystemTenantID
-			args.SrcTenantName = "system"
-		}
-		telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
-		c, cleanup := replicationtestutils.CreateMultiTenantStreamingCluster(ctx, t, args)
-		defer cleanup()
-
-		// Make sure we have data on all nodes, so that we will have multiple
-		// connections and client addresses (and actually test multi-node).
-		replicationtestutils.CreateScatteredTable(t, c, 3)
-
-		producerJobID, ingestionJobID := c.StartStreamReplication(ctx)
-		jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
-		jobutils.WaitForJobToRun(c.T, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-
-		c.SrcExec(func(t *testing.T, sysSQL *sqlutils.SQLRunner, tenantSQL *sqlutils.SQLRunner) {
-			tenantSQL.Exec(t, "CREATE TABLE d.x (id INT PRIMARY KEY, n INT)")
-			tenantSQL.Exec(t, "INSERT INTO d.x VALUES (1, 1)")
-		})
-
-		c.DestSysSQL.Exec(t, `PAUSE JOB $1`, ingestionJobID)
-		jobutils.WaitForJobToPause(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-		c.SrcExec(func(t *testing.T, sysSQL *sqlutils.SQLRunner, tenantSQL *sqlutils.SQLRunner) {
-			tenantSQL.Exec(t, "INSERT INTO d.x VALUES (2, 2)")
-		})
-		c.DestSysSQL.Exec(t, `RESUME JOB $1`, ingestionJobID)
-		jobutils.WaitForJobToRun(t, c.DestSysSQL, jobspb.JobID(ingestionJobID))
-
-		c.SrcExec(func(t *testing.T, sysSQL *sqlutils.SQLRunner, tenantSQL *sqlutils.SQLRunner) {
-			tenantSQL.Exec(t, "INSERT INTO d.x VALUES (3, 3)")
-		})
-
-		c.WaitUntilStartTimeReached(jobspb.JobID(ingestionJobID))
-
-		cutoverTime := c.DestSysServer.Clock().Now()
-		c.Cutover(ctx, producerJobID, ingestionJobID, cutoverTime.GoTime(), false)
-		counts := telemetry.GetFeatureCounts(telemetry.Raw, telemetry.ResetCounts)
-		require.GreaterOrEqual(t, counts["physical_replication.cutover"], int32(1))
-		c.RequireFingerprintMatchAtTimestamp(cutoverTime.AsOfSystemTime())
-
-		// Since the data was distributed across multiple nodes, multiple nodes should've been connected to
-		require.Greater(t, len(clientAddresses), 1)
-	})
 }
 
 func TestSpecsPersistedOnlyAfterInitialPlan(t *testing.T) {
@@ -787,6 +748,7 @@ func TestStreamingAutoReplan(t *testing.T) {
 	ctx := context.Background()
 	args := replicationtestutils.DefaultTenantStreamingClustersArgs
 	args.MultitenantSingleClusterNumNodes = 1
+	args.RoutingMode = streamclient.RoutingModeNode
 
 	retryErrorChan := make(chan error)
 	turnOffReplanning := make(chan struct{})
@@ -802,7 +764,6 @@ func TestStreamingAutoReplan(t *testing.T) {
 			clientAddresses[addr] = struct{}{}
 		},
 		AfterRetryIteration: func(err error) {
-
 			if err != nil && !alreadyReplanned.Load() {
 				retryErrorChan <- err
 				<-turnOffReplanning
@@ -1116,9 +1077,10 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 	rowStr := c.DestSysSQL.QueryStr(t, fmt.Sprintf("SHOW TENANT %s WITH REPLICATION STATUS", args.DestTenantName))
 	require.Equal(t, "2", rowStr[0][0])
 	require.Equal(t, "destination", rowStr[0][1])
-	if rowStr[0][3] == "NULL" {
+	require.Equal(t, fmt.Sprintf("%d", ingestionJobID), rowStr[0][2])
+	if rowStr[0][4] == "NULL" {
 		// There is no source yet, therefore the replication is not fully initialized.
-		require.Equal(t, "initializing replication", rowStr[0][2])
+		require.Equal(t, "initializing replication", rowStr[0][3])
 	}
 
 	jobutils.WaitForJobToRun(c.T, c.SrcSysSQL, jobspb.JobID(producerJobID))
@@ -1133,6 +1095,7 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 	var (
 		id             int
 		dest           string
+		jobID          int
 		status         string
 		source         string
 		sourceUri      string
@@ -1142,8 +1105,9 @@ func TestTenantStreamingShowTenant(t *testing.T) {
 		cutoverTime    []byte // should be nil
 	)
 	row := c.DestSysSQL.QueryRow(t, fmt.Sprintf("SHOW TENANT %s WITH REPLICATION STATUS", args.DestTenantName))
-	row.Scan(&id, &dest, &source, &sourceUri, &protectedTime, &maxReplTime, &replicationLag, &cutoverTime, &status)
+	row.Scan(&id, &dest, &jobID, &source, &sourceUri, &protectedTime, &maxReplTime, &replicationLag, &cutoverTime, &status)
 	require.Equal(t, 2, id)
+	require.Equal(t, ingestionJobID, jobID)
 	require.Equal(t, "destination", dest)
 	require.Equal(t, "replicating", status)
 	parsedUri, err := streamclient.ParseClusterUri(c.SrcURL.String())

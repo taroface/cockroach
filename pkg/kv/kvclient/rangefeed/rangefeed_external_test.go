@@ -619,7 +619,7 @@ func TestWithOnSSTable(t *testing.T) {
 		}
 		sst, sstStart, sstEnd := storageutils.MakeSST(t, tsrv.ClusterSettings(), sstKVs)
 		_, _, _, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
-			false /* disallowConflicts */, false /* disallowShadowing */, hlc.Timestamp{},
+			false /* disallowConflicts */, hlc.Timestamp{},
 			nil, /* stats */
 			false /* ingestAsWrites */, now)
 		require.Nil(t, pErr)
@@ -726,7 +726,7 @@ func TestWithOnSSTableCatchesUpIfNotSet(t *testing.T) {
 		expectKVs := kvs{pointKV("c", ts, "3"), pointKV("d", ts, "4")}
 		sst, sstStart, sstEnd := storageutils.MakeSST(t, srv.ClusterSettings(), sstKVs)
 		_, _, _, pErr := db.AddSSTableAtBatchTimestamp(ctx, sstStart, sstEnd, sst,
-			false /* disallowConflicts */, false /* disallowShadowing */, hlc.Timestamp{},
+			false /* disallowConflicts */, hlc.Timestamp{},
 			nil, /* stats */
 			false /* ingestAsWrites */, now)
 		require.Nil(t, pErr)
@@ -1585,7 +1585,7 @@ func TestRangeFeedIntentResolutionRace(t *testing.T) {
 			require.False(t, commitTS.LessEq(c.ResolvedTS),
 				"repl %s emitted checkpoint %s beyond write timestamp %s", repl3, c.ResolvedTS, commitTS)
 		case v := <-valueC:
-			require.Fail(t, "repl3 emitted premature value %s", v)
+			require.Failf(t, "repl3 emitted premature value", "value: %#+v", v)
 		case <-waitC:
 			done = true
 		}

@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -198,7 +199,7 @@ func DecodePlanGistToRows(
 	if err != nil {
 		return nil, err
 	}
-	err = Emit(ctx, evalCtx, explainPlan, ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
+	err = Emit(ctx, evalCtx, explainPlan, ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" }, false /* createPostQueryPlanIfMissing */)
 	if err != nil {
 		return nil, err
 	}
@@ -654,6 +655,17 @@ func (u *unknownTable) Trigger(i int) cat.Trigger {
 	panic(errors.AssertionFailedf("not implemented"))
 }
 
+// IsRowLevelSecurityEnabled is part of the cat.Table interface
+func (u *unknownTable) IsRowLevelSecurityEnabled() bool { return false }
+
+// PolicyCount is part of the cat.Table interface
+func (u *unknownTable) PolicyCount(polType tree.PolicyType) int { return 0 }
+
+// Policy is part of the cat.Table interface
+func (u *unknownTable) Policy(polType tree.PolicyType, i int) cat.Policy {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
 var _ cat.Table = &unknownTable{}
 
 // unknownTable implements the cat.Index interface and is used to represent
@@ -681,12 +693,8 @@ func (u *unknownIndex) IsUnique() bool {
 	return false
 }
 
-func (u *unknownIndex) IsInverted() bool {
-	return false
-}
-
-func (u *unknownIndex) IsVector() bool {
-	return false
+func (u *unknownIndex) Type() idxtype.T {
+	return idxtype.FORWARD
 }
 
 func (u *unknownIndex) GetInvisibility() float64 {

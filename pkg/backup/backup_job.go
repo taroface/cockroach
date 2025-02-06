@@ -463,10 +463,6 @@ func backup(
 
 	// Write a `BACKUP_METADATA` file along with SSTs for all the alloc heavy
 	// fields elided from the `BACKUP_MANIFEST`.
-	//
-	// TODO(adityamaru,rhu713): Once backup/restore switches from writing and
-	// reading backup manifests to `metadata.sst` we can stop writing the slim
-	// manifest.
 	if backupinfo.WriteMetadataWithExternalSSTsEnabled.Get(&settings.SV) {
 		if err := backupinfo.WriteMetadataWithExternalSSTs(ctx, defaultStore, encryption,
 			&kmsEnv, backupManifest); err != nil {
@@ -477,17 +473,6 @@ func backup(
 	statsTable := getTableStatsForBackup(ctx, statsCache, backupManifest.Descriptors)
 	if err := backupinfo.WriteTableStatistics(ctx, defaultStore, encryption, &kmsEnv, &statsTable); err != nil {
 		return roachpb.RowCount{}, 0, err
-	}
-
-	if backupinfo.WriteMetadataSST.Get(&settings.SV) {
-		if err := backupinfo.WriteBackupMetadataSST(ctx, defaultStore, encryption, &kmsEnv, backupManifest,
-			statsTable.Statistics); err != nil {
-			err = errors.Wrap(err, "writing forward-compat metadata sst")
-			if !build.IsRelease() {
-				return roachpb.RowCount{}, 0, err
-			}
-			log.Warningf(ctx, "%+v", err)
-		}
 	}
 
 	return backupManifest.EntryCounts, numBackupInstances, nil
@@ -586,6 +571,7 @@ func (b *backupResumer) DumpTraceAfterRun() bool {
 func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// The span is finished by the registry executing the job.
 	details := b.job.Details().(jobspb.BackupDetails)
+	origDetails := details
 	p := execCtx.(sql.JobExecContext)
 
 	if err := maybeRelocateJobExecution(ctx, b.job.ID(), p, details.ExecutionLocality, "BACKUP"); err != nil {
@@ -991,6 +977,11 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 			telemetry.CountBucketed("backup.speed-mbps.inc.per-node", mbps/int64(numBackupInstances))
 		}
 		logutil.LogJobCompletion(ctx, b.getTelemetryEventType(), b.job.ID(), true, nil, res.Rows)
+	}
+
+	// TODO (kev-cao): Update this to simply write a job record to run a backup compaction job.
+	if err := maybeCompactIncrementals(ctx, p, origDetails, b.job.ID()); err != nil {
+		return err
 	}
 
 	return b.maybeNotifyScheduledJobCompletion(
@@ -1707,7 +1698,7 @@ func updateBackupDetails(
 	urisByLocalityKV map[string]string,
 	prevBackups []backuppb.BackupManifest,
 	encryptionOptions *jobspb.BackupEncryptionOptions,
-	kmsEnv *backupencryption.BackupKMSEnv,
+	kmsEnv cloud.KMSEnv,
 ) (jobspb.BackupDetails, error) {
 	var err error
 	var startTime hlc.Timestamp

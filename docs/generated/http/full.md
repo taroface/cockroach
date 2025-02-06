@@ -1349,7 +1349,6 @@ of a range.
 | ----- | ---- | ----- | ----------- | -------------- |
 | index_to_send | [uint64](#cockroach.server.serverpb.RaftDebugResponse-uint64) |  |  | [reserved](#support-status) |
 | next_raft_index_initial | [uint64](#cockroach.server.serverpb.RaftDebugResponse-uint64) |  |  | [reserved](#support-status) |
-| next_raft_index | [uint64](#cockroach.server.serverpb.RaftDebugResponse-uint64) |  |  | [reserved](#support-status) |
 | force_flush_stop_index | [uint64](#cockroach.server.serverpb.RaftDebugResponse-uint64) |  |  | [reserved](#support-status) |
 | eval_tokens_held | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) | repeated |  | [reserved](#support-status) |
 | send_tokens_held | [int64](#cockroach.server.serverpb.RaftDebugResponse-int64) | repeated |  | [reserved](#support-status) |
@@ -1648,7 +1647,6 @@ of a range.
 | ----- | ---- | ----- | ----------- | -------------- |
 | index_to_send | [uint64](#cockroach.server.serverpb.RangesResponse-uint64) |  |  | [reserved](#support-status) |
 | next_raft_index_initial | [uint64](#cockroach.server.serverpb.RangesResponse-uint64) |  |  | [reserved](#support-status) |
-| next_raft_index | [uint64](#cockroach.server.serverpb.RangesResponse-uint64) |  |  | [reserved](#support-status) |
 | force_flush_stop_index | [uint64](#cockroach.server.serverpb.RangesResponse-uint64) |  |  | [reserved](#support-status) |
 | eval_tokens_held | [int64](#cockroach.server.serverpb.RangesResponse-int64) | repeated |  | [reserved](#support-status) |
 | send_tokens_held | [int64](#cockroach.server.serverpb.RangesResponse-int64) | repeated |  | [reserved](#support-status) |
@@ -4082,7 +4080,6 @@ of a range.
 | ----- | ---- | ----- | ----------- | -------------- |
 | index_to_send | [uint64](#cockroach.server.serverpb.RangeResponse-uint64) |  |  | [reserved](#support-status) |
 | next_raft_index_initial | [uint64](#cockroach.server.serverpb.RangeResponse-uint64) |  |  | [reserved](#support-status) |
-| next_raft_index | [uint64](#cockroach.server.serverpb.RangeResponse-uint64) |  |  | [reserved](#support-status) |
 | force_flush_stop_index | [uint64](#cockroach.server.serverpb.RangeResponse-uint64) |  |  | [reserved](#support-status) |
 | eval_tokens_held | [int64](#cockroach.server.serverpb.RangeResponse-int64) | repeated |  | [reserved](#support-status) |
 | send_tokens_held | [int64](#cockroach.server.serverpb.RangeResponse-int64) | repeated |  | [reserved](#support-status) |
@@ -4263,7 +4260,7 @@ Support status: [reserved](#support-status)
 | ----- | ---- | ----- | ----------- | -------------- |
 | store_id | [int32](#cockroach.server.serverpb.StoresResponse-int32) |  |  | [reserved](#support-status) |
 | node_id | [int32](#cockroach.server.serverpb.StoresResponse-int32) |  |  | [reserved](#support-status) |
-| encryption_status | [bytes](#cockroach.server.serverpb.StoresResponse-bytes) |  | encryption_status is a serialized ccl/storageccl/engineccl/enginepbccl/stats.go::EncryptionStatus protobuf. | [reserved](#support-status) |
+| encryption_status | [bytes](#cockroach.server.serverpb.StoresResponse-bytes) |  | encryption_status is a serialized storage/enginepb/stats.go::EncryptionStatus protobuf. | [reserved](#support-status) |
 | total_files | [uint64](#cockroach.server.serverpb.StoresResponse-uint64) |  | Basic file stats when encryption is enabled. Total files/bytes. | [reserved](#support-status) |
 | total_bytes | [uint64](#cockroach.server.serverpb.StoresResponse-uint64) |  |  | [reserved](#support-status) |
 | active_key_files | [uint64](#cockroach.server.serverpb.StoresResponse-uint64) |  | Files/bytes using the active data key. | [reserved](#support-status) |
@@ -6402,7 +6399,6 @@ SettingsRequest inquires what are the current settings in the cluster.
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | keys | [string](#cockroach.server.serverpb.SettingsRequest-string) | repeated | The array of setting keys or names to retrieve. An empty keys array means "all". | [reserved](#support-status) |
-| unredacted_values | [bool](#cockroach.server.serverpb.SettingsRequest-bool) |  | Indicate whether to see unredacted setting values. This is opt-in so that a previous version `cockroach zip` does not start reporting values when this becomes active. For good security, the server only obeys this after it checks that the logger-in user has admin privilege. | [reserved](#support-status) |
 
 
 

@@ -234,6 +234,8 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			dropCascadeDescriptor(next, t.FunctionID)
 		case *scpb.TriggerDeps:
 			dropCascadeDescriptor(next, t.TableID)
+		case *scpb.PolicyDeps:
+			dropCascadeDescriptor(next, t.TableID)
 		case *scpb.Column, *scpb.ColumnType, *scpb.SecondaryIndexPartial:
 			// These only have type references.
 			break
@@ -245,6 +247,8 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			*scpb.ColumnDefaultExpression,
 			*scpb.ColumnOnUpdateExpression,
 			*scpb.ColumnComputeExpression,
+			*scpb.PolicyUsingExpr,
+			*scpb.PolicyWithCheckExpr,
 			*scpb.CheckConstraint,
 			*scpb.CheckConstraintUnvalidated,
 			*scpb.ForeignKeyConstraint,
@@ -253,7 +257,7 @@ func dropCascadeDescriptor(b BuildCtx, id catid.DescID) {
 			*scpb.DatabaseRegionConfig:
 			b.Drop(e)
 		default:
-			panic(errors.AssertionFailedf("un-dropped backref %T (%v) should be either be"+
+			panic(errors.AssertionFailedf("un-dropped backref %T (%v) should either be "+
 				"dropped or skipped", e, target))
 		}
 	})
@@ -1835,6 +1839,33 @@ func failIfRLSIsNotEnabled(b BuildCtx) {
 	}
 	if !b.SessionData().RowLevelSecurityEnabled ||
 		!b.EvalCtx().Settings.Version.ActiveVersion(b).IsActive(clusterversion.V25_1) {
-		panic(unimplemented.NewWithIssue(136696, "CREATE POLICY is not yet implemented"))
+		panic(unimplemented.NewWithIssue(73596, "row-level security is not yet implemented"))
+	}
+}
+
+// failIfSafeUpdates checks if the sql_safe_updates is present, and if so, it
+// will fail the operation.
+func failIfSafeUpdates(b BuildCtx, n tree.NodeFormatter) {
+	if b.SessionData().SafeUpdates {
+		var errorWithMessage error
+		switch n.(type) {
+		case *tree.AlterTableAlterColumnType:
+			errorWithMessage = errors.New("ALTER COLUMN TYPE requiring data rewrite may result in data loss " +
+				"for certain type conversions or when applying a USING clause")
+		case *tree.DropIndex:
+			errorWithMessage = errors.New("DROP INDEX")
+		default:
+			panic(errors.AssertionFailedf("programming error: unexpected node type %T", n))
+		}
+
+		panic(
+			pgerror.WithCandidateCode(
+				errors.WithMessage(
+					errorWithMessage,
+					"rejected (sql_safe_updates = true)",
+				),
+				pgcode.Warning,
+			),
+		)
 	}
 }
